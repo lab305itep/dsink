@@ -1,0 +1,1 @@
+LDFLAGS=-lreadline -lconfig
