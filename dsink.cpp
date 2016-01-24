@@ -4,6 +4,7 @@
 #define _FILE_OFFSET_BITS 64
 #include <arpa/inet.h>
 #include <ctype.h>
+#include <errno.h>
 #include <libconfig.h>
 #include <netinet/in.h>
 #include <readline/history.h>
@@ -22,6 +23,8 @@
 #define MAXSTR	1024
 #define MBYTE	0x100000
 #define DEFCONFIG	"general.conf"
+#define SSH	"/usr/bin/ssh"
+#define SHELL	"/bin/sh"
 
 /*				Types and declarations		*/
 pid_t StartProcess(char *cmd);
@@ -32,6 +35,17 @@ struct con_struct {
 	int len;
 	long long cnt;
 	struct rec_header_struct *header;
+};
+struct pipe_struct {
+	int fd[2];
+	FILE* f;
+};
+
+struct slave_struct {
+	pid_t PID;
+	struct pipe_struct in;
+	struct pipe_struct out;
+	struct pipe_struct err;		
 };
 
 /*				Global variables		*/
@@ -56,8 +70,7 @@ struct run_struct {
 	FILE *fLog;
 	pid_t fLogPID;
 	int fdPort;
-	FILE *fSlave[MAXCON];
-	int fdSlave[MAXCON];
+	struct slave_struct Slave[MAXCON];
 	con_struct Con[MAXCON];
 	int NCon;
 	int iStop;
@@ -210,20 +223,56 @@ int OpenLog(void)
 /*	Open command connection to VME crates and start uwfdtool in them	*/
 int OpenSlaves(void)
 {
-	int i;
-	char cmd[MAXSTR];
+	int i, irc;
+	pid_t pid;
 
 	for (i=0; i<Config.NSlaves; i++) {
-		snprintf(cmd, MAXSTR, "ssh %s \"%s\"", Config.SlaveList[i], Config.SlaveCMD);
-		Run.fSlave[i] = popen(cmd, "r");
-		if (!Run.fSlave[i]) {
-			fprintf(Run.fLog, "Can not do ssh to %s: %s (%m)\n", Config.SlaveList[i], cmd);
-			return -10;
+		if (TEMP_FAILURE_RETRY(pipe(Run.Slave[i].in.fd))) {
+			fprintf(Run.fLog, "DSINK: Can not create in pipe for %s: %m\n", Config.SlaveList[i]);			
+			return -1;
 		}
-		Run.fdSlave[i] = fileno(Run.fSlave[i]);
-		if (Run.fdSlave[i] == -1) {
-			fprintf(Run.fLog, "Can not get fd of ssh to %s\n", Config.SlaveList[i]);
-			return -21;			
+		if (TEMP_FAILURE_RETRY(pipe(Run.Slave[i].out.fd))) {
+			fprintf(Run.fLog, "DSINK: Can not create out pipe for %s: %m\n", Config.SlaveList[i]);			
+			return -2;
+		}
+		if (TEMP_FAILURE_RETRY(pipe(Run.Slave[i].err.fd))) {
+			fprintf(Run.fLog, "DSINK: Can not create error pipe for %s: %m\n", Config.SlaveList[i]);			
+			return -3;
+		}
+		pid = fork();
+		if ((int) pid < 0) {		// error
+			fprintf(Run.fLog, "DSINK: Can not fork for %s: %m\n", Config.SlaveList[i]);			
+			return -10;
+		} else if ((int) irc == 0) {	// child process
+			dup2(Run.Slave[i].in.fd[0], STDIN_FILENO);
+			TEMP_FAILURE_RETRY(close(Run.Slave[i].in.fd[0]));
+			dup2(Run.Slave[i].out.fd[1], STDOUT_FILENO);
+			TEMP_FAILURE_RETRY(close(Run.Slave[i].out.fd[1]));
+			dup2(Run.Slave[i].err.fd[1], STDERR_FILENO);
+			TEMP_FAILURE_RETRY(close(Run.Slave[i].err.fd[1]));
+			execl(SSH, SSH, Config.SlaveCMD, NULL);
+			fprintf(Run.fLog, "DSINK: Can not do ssh %s: %s (%m)\n", Config.SlaveList[i], Config.SlaveCMD);	// we shouldn't get here after execl
+			exit(-20);
+		} else {			// main process
+			Run.Slave[i].PID = pid;
+			TEMP_FAILURE_RETRY(close(Run.Slave[i].in.fd[0]));
+			TEMP_FAILURE_RETRY(close(Run.Slave[i].out.fd[1]));
+			TEMP_FAILURE_RETRY(close(Run.Slave[i].err.fd[1]));
+			Run.Slave[i].in.f = fdopen(Run.Slave[i].in.fd[1], "w");
+			if (Run.Slave[i].in.f < 0) {
+				fprintf(Run.fLog, "DSINK: fdopen for stdin failed for %s: %m\n", Config.SlaveList[i]);
+				return -30;
+			}
+			Run.Slave[i].out.f = fdopen(Run.Slave[i].out.fd[0], "r");
+			if (Run.Slave[i].out.f < 0) {
+				fprintf(Run.fLog, "DSINK: fdopen for stdout failed for %s: %m\n", Config.SlaveList[i]);
+				return -31;
+			}
+			Run.Slave[i].err.f = fdopen(Run.Slave[i].err.fd[0], "r");
+			if (Run.Slave[i].err.f < 0) {
+				fprintf(Run.fLog, "DSINK: fdopen for stderr failed for %s: %m\n", Config.SlaveList[i]);
+				return -32;
+			}
 		}
 	}
 	return 0;
@@ -233,10 +282,14 @@ int OpenSlaves(void)
 void CloseSlaves(void)
 {
 	int i;
-	for (i=0; i<Config.NSlaves; i++) if (Run.fSlave[i]) {
-		fprintf(Run.fSlave[i], "q\n");
-		fprintf(Run.fSlave[i], "q\n");
-		pclose(Run.fSlave[i]);
+	for (i=0; i<Config.NSlaves; i++) {
+		if (Run.Slave[i].in.f) {
+			fprintf(Run.Slave[i].in.f, "q\n");
+			fprintf(Run.Slave[i].in.f, "q\n");
+			fclose(Run.Slave[i].in.f);
+		}
+		if (Run.Slave[i].out.f) fclose(Run.Slave[i].out.f);
+		if (Run.Slave[i].err.f) fclose(Run.Slave[i].err.f);
 	}
 }
 
@@ -309,7 +362,7 @@ pid_t StartProcess(char *cmd)
 	
 	pid = fork();
 	if (!pid) {
-		execl("/bin/bash", "/bin/bash", "-c", cmd, NULL);
+		execl(SHELL, SHELL, "-c", cmd, NULL);
 		printf("Wrong return\n");
 		return -20;
 	} else if (pid < 0) {
@@ -334,17 +387,17 @@ void Help(void)
 }
 
 /*	Get text output from slave and send it to log				*/
-void GetFromSlave(int i)
+void GetFromSlave(char *name, FILE *f)
 {
 	char str[MAXSTR];
-	fgets(str, MAXSTR, Run.fSlave[i]);
-	fprintf(Run.fLog, "%s: %s", Config.SlaveList[i], str);
+	fgets(str, MAXSTR, f);
+	fprintf(Run.fLog, "%s: %s", name, str);
 }
 
 /*	Process commands							*/
 static void ProcessCmd(char *cmd)
 {
-	
+	printf("CMD> %s <\n", cmd);
 }
 
 /*	The main								*/
@@ -355,11 +408,14 @@ int main(int argc, char **argv)
 	int i, irc;
 	time_t theTime;
 	
+	printf("DSINK: begin\n");
+
 	memset(&Run, 0, sizeof(Run));
 	read_history(".dsink_history");
 
 	if (ReadConf((char *)DEFCONFIG)) goto MyExit;
 	if (OpenLog()) goto MyExit;
+
 	theTime = time(NULL);
 	fprintf(Run.fLog, "%sDSINK started.\n", ctime(&theTime));
 
@@ -367,6 +423,7 @@ int main(int argc, char **argv)
 	if (Run.fdPort < 0) goto MyExit;	
 
 	if (OpenSlaves()) goto MyExit;
+	printf("DSINK: slaves opened\n");
 
 	rl_callback_handler_install("DSINK >", ProcessCmd);	
 
@@ -380,12 +437,13 @@ int main(int argc, char **argv)
 		FD_SET(fileno (rl_instream), &set);
 		FD_SET(Run.fdPort, &set);
 		for (i=0; i<Run.NCon; i++) FD_SET(Run.Con[i].fd, &set);
-		for (i=0; i<Config.NSlaves; i++) FD_SET(Run.fdSlave[i], &set);
+		for (i=0; i<Config.NSlaves; i++) FD_SET(Run.Slave[i].out.fd[0], &set);
+		for (i=0; i<Config.NSlaves; i++) FD_SET(Run.Slave[i].err.fd[0], &set);
 
 		irc = select(FD_SETSIZE, &set, NULL, NULL, &tm);
 		if (irc < 0) continue;
 
-		if (FD_ISSET(fileno (rl_instream), &set)) rl_callback_read_char ();
+		if (FD_ISSET(fileno (rl_instream), &set)) rl_callback_read_char();
 		if (FD_ISSET(Run.fdPort, &set)) {
 			if (Run.NCon < MAXCON) {
 				OpenCon(Run.fdPort, &Run.Con[Run.NCon]);
@@ -395,7 +453,8 @@ int main(int argc, char **argv)
 			}
 		}
 		for (i=0; i<Run.NCon; i++) if (FD_ISSET(Run.Con[i].fd, &set)) GetAndWrite(i);
-		for (i=0; i<Config.NSlaves; i++) if (FD_ISSET(Run.fdSlave[i], &set)) GetFromSlave(i);
+		for (i=0; i<Config.NSlaves; i++) if (FD_ISSET(Run.Slave[i].out.fd[0], &set)) GetFromSlave(Config.SlaveList[i], Run.Slave[i].out.f);
+		for (i=0; i<Config.NSlaves; i++) if (FD_ISSET(Run.Slave[i].err.fd[0], &set)) GetFromSlave(Config.SlaveList[i], Run.Slave[i].err.f);
 		CleanCon();
 		fflush(Run.fLog);
 	}
