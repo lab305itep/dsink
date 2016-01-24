@@ -239,18 +239,36 @@ int OpenSlaves(void)
 			fprintf(Run.fLog, "DSINK: Can not create error pipe for %s: %m\n", Config.SlaveList[i]);			
 			return -3;
 		}
+		Run.Slave[i].in.f = fdopen(Run.Slave[i].in.fd[1], "w");
+		if (Run.Slave[i].in.f < 0) {
+			fprintf(Run.fLog, "DSINK: fdopen for stdin failed for %s: %m\n", Config.SlaveList[i]);
+			return -30;
+		}
+		Run.Slave[i].out.f = fdopen(Run.Slave[i].out.fd[0], "r");
+		if (Run.Slave[i].out.f < 0) {
+			fprintf(Run.fLog, "DSINK: fdopen for stdout failed for %s: %m\n", Config.SlaveList[i]);
+			return -31;
+		}
+		Run.Slave[i].err.f = fdopen(Run.Slave[i].err.fd[0], "r");
+		if (Run.Slave[i].err.f < 0) {
+			fprintf(Run.fLog, "DSINK: fdopen for stderr failed for %s: %m\n", Config.SlaveList[i]);
+			return -32;
+		}
 		pid = fork();
 		if ((int) pid < 0) {		// error
 			fprintf(Run.fLog, "DSINK: Can not fork for %s: %m\n", Config.SlaveList[i]);			
 			return -10;
-		} else if ((int) irc == 0) {	// child process
+		} else if ((int) pid == 0) {	// child process
 			dup2(Run.Slave[i].in.fd[0], STDIN_FILENO);
 			TEMP_FAILURE_RETRY(close(Run.Slave[i].in.fd[0]));
+			TEMP_FAILURE_RETRY(close(Run.Slave[i].in.fd[1]));
 			dup2(Run.Slave[i].out.fd[1], STDOUT_FILENO);
+			TEMP_FAILURE_RETRY(close(Run.Slave[i].out.fd[0]));
 			TEMP_FAILURE_RETRY(close(Run.Slave[i].out.fd[1]));
 			dup2(Run.Slave[i].err.fd[1], STDERR_FILENO);
+			TEMP_FAILURE_RETRY(close(Run.Slave[i].err.fd[0]));
 			TEMP_FAILURE_RETRY(close(Run.Slave[i].err.fd[1]));
-			execl(SSH, SSH, Config.SlaveCMD, NULL);
+			execl(SSH, SSH, Config.SlaveList[i], Config.SlaveCMD, NULL);
 			fprintf(Run.fLog, "DSINK: Can not do ssh %s: %s (%m)\n", Config.SlaveList[i], Config.SlaveCMD);	// we shouldn't get here after execl
 			exit(-20);
 		} else {			// main process
@@ -258,21 +276,6 @@ int OpenSlaves(void)
 			TEMP_FAILURE_RETRY(close(Run.Slave[i].in.fd[0]));
 			TEMP_FAILURE_RETRY(close(Run.Slave[i].out.fd[1]));
 			TEMP_FAILURE_RETRY(close(Run.Slave[i].err.fd[1]));
-			Run.Slave[i].in.f = fdopen(Run.Slave[i].in.fd[1], "w");
-			if (Run.Slave[i].in.f < 0) {
-				fprintf(Run.fLog, "DSINK: fdopen for stdin failed for %s: %m\n", Config.SlaveList[i]);
-				return -30;
-			}
-			Run.Slave[i].out.f = fdopen(Run.Slave[i].out.fd[0], "r");
-			if (Run.Slave[i].out.f < 0) {
-				fprintf(Run.fLog, "DSINK: fdopen for stdout failed for %s: %m\n", Config.SlaveList[i]);
-				return -31;
-			}
-			Run.Slave[i].err.f = fdopen(Run.Slave[i].err.fd[0], "r");
-			if (Run.Slave[i].err.f < 0) {
-				fprintf(Run.fLog, "DSINK: fdopen for stderr failed for %s: %m\n", Config.SlaveList[i]);
-				return -32;
-			}
 		}
 	}
 	return 0;
@@ -284,8 +287,8 @@ void CloseSlaves(void)
 	int i;
 	for (i=0; i<Config.NSlaves; i++) {
 		if (Run.Slave[i].in.f) {
-			fprintf(Run.Slave[i].in.f, "q\n");
-			fprintf(Run.Slave[i].in.f, "q\n");
+			fprintf(Run.Slave[i].in.f, "q\r\n");
+			fprintf(Run.Slave[i].in.f, "q\r\n");
 			fclose(Run.Slave[i].in.f);
 		}
 		if (Run.Slave[i].out.f) fclose(Run.Slave[i].out.f);
@@ -377,8 +380,9 @@ void Help(void)
 {
 	printf("Usage: dsink\n");
 	printf("Commands:\n");
-	printf("cmd <vme> <uwfdtool command> - send command to vme crate;\n");
+	printf("cmd <vme>|* <uwfdtool command> - send command to vme crate;\n");
 	printf("file [<file_name>] - set file to write data;\n");
+	printf("help - print this message;\n");
 	printf("info - print statistics;\n");
 	printf("init - init vme modules;\n");
 	printf("list - list connected slaves;\n");
@@ -391,13 +395,65 @@ void GetFromSlave(char *name, FILE *f)
 {
 	char str[MAXSTR];
 	fgets(str, MAXSTR, f);
+	str[MAXSTR-1] = '\0';
 	fprintf(Run.fLog, "%s: %s", name, str);
 }
 
 /*	Process commands							*/
 static void ProcessCmd(char *cmd)
 {
-	printf("CMD> %s <\n", cmd);
+	char *tok;
+	const char DELIM[] = " \t:,";
+	char copy[MAXSTR];
+	int i, num;
+
+	if (!cmd || !cmd[0]) return;
+	add_history(cmd);
+	strncpy(copy, cmd, MAXSTR);
+	tok = strtok(cmd, DELIM);
+	if (!tok || !tok[0]) return;
+	
+	if (!strcasecmp(tok, "cmd")) {	// Send command to slave(s)
+		tok = strtok(NULL, DELIM);
+		if (!tok || !tok[0]) {
+			printf("Not enough arguments: %s\n", copy);
+			Help();
+			return;
+		}
+		num = (tok[0] == '*') ? -1 : strtol(tok, NULL, 0);
+		if (num < -1 || num >= Config.NSlaves) {
+			printf("Wrong crate number in the list: %d\n", num);
+			return;
+		}
+		tok = strtok(NULL, DELIM);
+		if (!tok || !tok[0]) {
+			printf("Not enough arguments: %s\n", copy);
+			Help();
+			return;
+		}
+		if (num < 0) {
+			for (i=0; i<Config.NSlaves; i++) fprintf(Run.Slave[i].in.f, "%s\r\n", &copy[tok - cmd]);
+		} else {
+			fprintf(Run.Slave[num].in.f, "%s\r\n", &copy[tok - cmd]);
+		}
+	} else if (!strcasecmp(tok, "file")) {	// Open file to write data
+	} else if (!strcasecmp(tok, "help")) {	// Print help
+		Help();
+	} else if (!strcasecmp(tok, "info")) {	// Print statistics
+	} else if (!strcasecmp(tok, "init")) {	// Initialize DAQ
+		for (i=0; i<Config.NSlaves; i++) fprintf(Run.Slave[i].in.f, "%s\r\n", Config.InitScript);
+	} else if (!strcasecmp(tok, "list")) {	// List slaves
+		printf("No\tName\n");
+		for (i=0; i<Config.NSlaves; i++) printf("%4d\t%s\n", Config.SlaveList[i]);
+	} else if (!strcasecmp(tok, "quit")) {	// Quit
+		Run.iStop = 1;
+	} else if (!strcasecmp(tok, "start")) {	// Start DAQ
+	} else if (!strcasecmp(tok, "stop")) {	// Stop DAQ
+	} else {				// Unknown command
+		printf("Unknown command: %s\n\n", tok);
+		Help();
+	}
+	for (i=0; i<Config.NSlaves; i++) fflush(Run.Slave[i].in.f);
 }
 
 /*	The main								*/
@@ -408,8 +464,6 @@ int main(int argc, char **argv)
 	int i, irc;
 	time_t theTime;
 	
-	printf("DSINK: begin\n");
-
 	memset(&Run, 0, sizeof(Run));
 	read_history(".dsink_history");
 
@@ -423,9 +477,8 @@ int main(int argc, char **argv)
 	if (Run.fdPort < 0) goto MyExit;	
 
 	if (OpenSlaves()) goto MyExit;
-	printf("DSINK: slaves opened\n");
 
-	rl_callback_handler_install("DSINK >", ProcessCmd);	
+	rl_callback_handler_install("DSINK > ", ProcessCmd);	
 
 	tm.tv_sec = 1;		// 1 s
 	tm.tv_usec = 0;
@@ -434,7 +487,7 @@ int main(int argc, char **argv)
 	while (!Run.iStop) {
 
 		FD_ZERO(&set);
-		FD_SET(fileno (rl_instream), &set);
+		FD_SET(fileno(rl_instream), &set);
 		FD_SET(Run.fdPort, &set);
 		for (i=0; i<Run.NCon; i++) FD_SET(Run.Con[i].fd, &set);
 		for (i=0; i<Config.NSlaves; i++) FD_SET(Run.Slave[i].out.fd[0], &set);
@@ -443,7 +496,7 @@ int main(int argc, char **argv)
 		irc = select(FD_SETSIZE, &set, NULL, NULL, &tm);
 		if (irc < 0) continue;
 
-		if (FD_ISSET(fileno (rl_instream), &set)) rl_callback_read_char();
+		if (FD_ISSET(fileno(rl_instream), &set)) rl_callback_read_char();
 		if (FD_ISSET(Run.fdPort, &set)) {
 			if (Run.NCon < MAXCON) {
 				OpenCon(Run.fdPort, &Run.Con[Run.NCon]);
@@ -459,7 +512,7 @@ int main(int argc, char **argv)
 		fflush(Run.fLog);
 	}
 MyExit:
-	
+	printf(" Good bye.\n");
 	for (i=0; i<Run.NCon; i++) {
 		free(Run.Con[i].buf);
 		close(Run.Con[i].fd);
