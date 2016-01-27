@@ -1,5 +1,6 @@
 /*
-	Simple data sink code for kserver
+	Simple data sink code for dserver
+	SvirLex, ITEP, 2016
 */
 #define _FILE_OFFSET_BITS 64
 #include <arpa/inet.h>
@@ -15,6 +16,7 @@
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/types.h>
+#include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 #include "recformat.h"
@@ -25,8 +27,13 @@
 #define DEFCONFIG	"general.conf"
 #define SSH	"/usr/bin/ssh"
 #define SHELL	"/bin/sh"
+#define TXT_BOLDRED	"\033[1;31m"
+#define TXT_BOLDGREEN	"\033[1;32m"
+#define TXT_NORMAL	"\033[0;39m"
+#define DEF_DATAFILE	"defsink.dat"
 
 /*				Types and declarations		*/
+void SendScript(FILE *f, const char *script);
 pid_t StartProcess(char *cmd);
 struct con_struct {
 	int fd;
@@ -67,13 +74,18 @@ struct cfg_struct {
 } Config;
 
 struct run_struct {
-	FILE *fLog;
-	pid_t fLogPID;
-	int fdPort;
-	struct slave_struct Slave[MAXCON];
-	con_struct Con[MAXCON];
-	int NCon;
-	int iStop;
+	FILE *fLog;			// Log file
+	pid_t fLogPID;			// Log file broser PID
+	FILE *fData;			// Data file
+	char fDataName[MAXSTR];		// Data file name
+	int iTempData;			// Signature of temporary file
+	int fdPort;			// Port for input data connections
+	struct slave_struct Slave[MAXCON];	// Slave VME connections
+	con_struct Con[MAXCON];		// Data connections
+	int NCon;			// Number of data connections
+	int iStop;			// Quit flag
+	int iRun;			// DAQ running flag
+	int Initialized;		// VME modules initialized
 } Run;
 
 /*				Functions			*/
@@ -106,30 +118,31 @@ int BindPort(void)
 	return fd;
 }
 
-/*	Open client data connection to the server		*/
-void OpenCon(int fd, con_struct *con)
+/*	Clean Con array from closed connections			*/
+void CleanCon(void)
 {
-	struct sockaddr_in addr;
-	socklen_t len;
-	int irc;
-	
-	memset(con, 0, sizeof(con_struct));
-	len = sizeof(addr);
-	irc = accept(fd, (struct sockaddr *)&addr, &len);
-	if (irc < 0) {
-		printf("Connection accept error: %m\n");
-		return;
+	int i, j;
+	for (j=0; j<Run.NCon; j++) if (Run.Con[j].fd < 0) {	
+		for (i=j; i<Run.NCon-1; i++) memcpy(&Run.Con[i], &Run.Con[i+1], sizeof(Run.Con[0]));
+		Run.NCon--;
 	}
-	con->buf = (char *)malloc(MBYTE);
-	if (!con->buf) {
-		printf("Can not allocate buffer of %d bytes: %m\n", MBYTE);
-		close(irc);
-		return;
+}
+
+/*	Close command connections						*/
+void CloseSlaves(void)
+{
+	int i;
+	for (i=0; i<Config.NSlaves; i++) {
+		if (Run.Slave[i].in.f) {
+			if (Run.Slave[i].PID) {
+				fprintf(Run.Slave[i].in.f, "q\n");
+				fprintf(Run.Slave[i].in.f, "q\n");
+			}
+			fclose(Run.Slave[i].in.f);
+		}
+		if (Run.Slave[i].out.f) fclose(Run.Slave[i].out.f);
+		if (Run.Slave[i].err.f) fclose(Run.Slave[i].err.f);
 	}
-	con->header = (struct rec_header_struct *) con->buf;
-	con->fd = irc;
-	con->ip = addr.sin_addr.s_addr;
-	printf("connection from %s accepted\n", inet_ntoa(addr.sin_addr));
 }
 
 /*	Ignore new connection if too many. Should never happen.	*/
@@ -149,17 +162,12 @@ void DropCon(int fd)
 	close(irc);
 }
 
-/*	Clean Con array from closed connections			*/
-void CleanCon(void)
+/*	Consider end of all pending events after select timeout		*/
+void FlushEvents(void)
 {
-	int i, j;
-	for (j=0; j<Run.NCon; j++) if (Run.Con[j].fd < 0) {	
-		for (i=j; i<Run.NCon-1; i++) memcpy(&Run.Con[i], &Run.Con[i+1], sizeof(Run.Con[0]));
-		Run.NCon--;
-	}
 }
 
-/*	Get Data						*/
+/*	Get Data							*/
 void GetAndWrite(int num)
 {
 	int irc;
@@ -187,7 +195,7 @@ void GetAndWrite(int num)
 		}
 		con->len += irc;
 		if (con->len  == con->header->len) {
-			if (con->header->ip != 0x7F000001) {
+			if (con->header->ip != INADDR_LOOPBACK) {
 				fprintf(Run.fLog, "DSINK: Wrong data signature %X - sychronization lost ? @%X\n", con->header->ip, con->ip);
 				free(con->buf);
 				close(con->fd);
@@ -202,6 +210,108 @@ void GetAndWrite(int num)
 		}
 	}
 	return;
+}
+
+/*	Get text output from slave and send it to log				*/
+void GetFromSlave(char *name, FILE *f)
+{
+	char str[MAXSTR];
+	fgets(str, MAXSTR, f);
+	str[MAXSTR-1] = '\0';
+	fprintf(Run.fLog, "%s: %s", name, str);
+}
+
+/*	Print Help								*/
+void Help(void)
+{
+	printf("Usage: dsink\n");
+	printf("Commands:\n");
+	printf("\tcmd <vme>|* <uwfdtool command> - send command to vme crate;\n");
+	printf("\tfile [<file_name>] - set file to write data;\n");
+	printf("\thelp - print this message;\n");
+	printf("\tinfo - print statistics;\n");
+	printf("\tinit - init vme modules;\n");
+	printf("\tlist - list connected slaves;\n");
+	printf("\tquit - Quit;\n");
+	printf("\tstart/stop - start/stop data taking;\n");
+	printf("To write data file example.dat:\n");
+	printf("\tinit\n");
+	printf("\tfile example.dat\n");
+	printf("\tstart\n");
+	printf("\t\t... DAQ started - wait for some data to be collected...\n");
+	printf("\tstop\n");
+	printf("You can omit init if you don't want system (re)initialization.\n");
+}
+
+void Info(void)
+{
+	printf("\nSystem Initialization %s done.\n", (Run.Initialized) ? "" : TXT_BOLDRED "not" TXT_NORMAL);
+	if (Run.fData && !Run.iTempData) printf("File: %s\n\t%Ld bytes\n", Run.fDataName, ftello(Run.fData));
+}
+
+void Init(void)
+{
+	int i;
+	for (i=0; i<Config.NSlaves; i++) if (Run.Slave[i].PID) SendScript(Run.Slave[i].in.f, Config.InitScript);
+	Run.Initialized = 1;
+}
+
+/*	Convert int to inet address						*/
+char *My_inet_ntoa(int num)
+{
+	struct in_addr addr;
+
+	addr.s_addr = num;
+	return inet_ntoa(addr);
+}
+
+/*	Open client data connection to the server				*/
+void OpenCon(int fd, con_struct *con)
+{
+	struct sockaddr_in addr;
+	socklen_t len;
+	int irc;
+	
+	memset(con, 0, sizeof(con_struct));
+	len = sizeof(addr);
+	irc = accept(fd, (struct sockaddr *)&addr, &len);
+	if (irc < 0) {
+		printf("Connection accept error: %m\n");
+		return;
+	}
+	con->buf = (char *)malloc(MBYTE);
+	if (!con->buf) {
+		printf("Can not allocate buffer of %d bytes: %m\n", MBYTE);
+		close(irc);
+		return;
+	}
+	con->header = (struct rec_header_struct *) con->buf;
+	con->fd = irc;
+	con->ip = addr.sin_addr.s_addr;
+	printf("connection from %s accepted\n", inet_ntoa(addr.sin_addr));
+}
+
+/*	Open file to write data							*/
+void OpenDataFile(char *name)
+{
+	Run.fDataName[MAXSTR-1] = '\0';	
+	if (Run.fData) fclose(Run.fData);
+	if (!name) {
+		snprintf(Run.fDataName, MAXSTR, "%s/%s", Config.DataDir, DEF_DATAFILE);
+		Run.iTempData = 1;
+	} else if (name[0] == '/') {
+		strncpy(Run.fDataName, name, MAXSTR);
+		Run.iTempData = 0;
+	} else {
+		snprintf(Run.fDataName, MAXSTR, "%s/%s", Config.DataDir, name);
+		Run.iTempData = 0;
+	}
+	Run.fData = fopen(Run.fDataName, (Run.iTempData) ? "w" : "a");	// we append to data files, but rewrite the default
+	if (!Run.fData) {
+		printf("\n" TXT_BOLDRED "ERROR: Can not open data file to write: %s (%m)" TXT_NORMAL "\n", Run.fDataName);
+		fprintf(Run.fLog, "DSINK: Can not open data file to write: %s (%m)\n", Run.fDataName);
+		Run.fDataName[0] = '\0';
+	}
 }
 
 /*	Open log file and xterm							*/
@@ -281,21 +391,6 @@ int OpenSlaves(void)
 	return 0;
 }
 
-/*	Close command connections						*/
-void CloseSlaves(void)
-{
-	int i;
-	for (i=0; i<Config.NSlaves; i++) {
-		if (Run.Slave[i].in.f) {
-			fprintf(Run.Slave[i].in.f, "q\r\n");
-			fprintf(Run.Slave[i].in.f, "q\r\n");
-			fclose(Run.Slave[i].in.f);
-		}
-		if (Run.Slave[i].out.f) fclose(Run.Slave[i].out.f);
-		if (Run.Slave[i].err.f) fclose(Run.Slave[i].err.f);
-	}
-}
-
 /*	Read configuration file							*/
 int ReadConf(char *fname)
 {
@@ -358,6 +453,22 @@ int ReadConf(char *fname)
 	return 0;
 }
 
+/*	Send a script divided by semicolons as separate lines to f		*/
+void SendScript(FILE *f, const char *script)
+{
+	char copy[MAXSTR];
+	char *tok;
+
+	strncpy(copy, script, MAXSTR);
+	tok = strtok(copy, ";");
+
+	for (;;) {
+		if (!tok || !tok[0]) break;
+		fprintf(f, "%s\n", tok);
+		tok = strtok(NULL, ";");
+	}
+}
+
 /*	Spawn a new process and return its PID					*/
 pid_t StartProcess(char *cmd)
 {
@@ -375,28 +486,36 @@ pid_t StartProcess(char *cmd)
 	return pid;
 }
 
-/*	Print Help								*/
-void Help(void)
+/*	start DAQ								*/
+void StartRun(void)
 {
-	printf("Usage: dsink\n");
-	printf("Commands:\n");
-	printf("cmd <vme>|* <uwfdtool command> - send command to vme crate;\n");
-	printf("file [<file_name>] - set file to write data;\n");
-	printf("help - print this message;\n");
-	printf("info - print statistics;\n");
-	printf("init - init vme modules;\n");
-	printf("list - list connected slaves;\n");
-	printf("quit - Quit;\n");
-	printf("start/stop - start/stop data taking;\n");
+	int i;
+	char str[MAXSTR];
+
+	for (i=0; i<Config.NSlaves; i++) if (!Run.Slave[i].PID) break;
+	if (i != Config.NSlaves) {
+		printf("\n" TXT_BOLDRED "Not all VME crates are attached. Can not start." TXT_NORMAL "\n");
+		fprintf(Run.fLog, "Not all VME crates are attached. Can not start.\n");
+		return;	
+	}
+	snprintf(str, MAXSTR, Config.StartScript, Config.MyName, Config.Port);
+	for (i=0; i<Config.NSlaves; i++) SendScript(Run.Slave[i].in.f, str);
+	sleep(1);
+	snprintf(str, MAXSTR, Config.InhibitScript, Config.TriggerMasterModule, 0);
+	SendScript(Run.Slave[Config.TriggerMasterCrate].in.f, str);
+	Run.iRun = 1;
 }
 
-/*	Get text output from slave and send it to log				*/
-void GetFromSlave(char *name, FILE *f)
+/*	Stop DAQ								*/
+void StopRun(void)
 {
+	int i;
 	char str[MAXSTR];
-	fgets(str, MAXSTR, f);
-	str[MAXSTR-1] = '\0';
-	fprintf(Run.fLog, "%s: %s", name, str);
+	snprintf(str, MAXSTR, Config.InhibitScript, Config.TriggerMasterModule, 1);
+	if (Run.Slave[Config.TriggerMasterCrate].PID) SendScript(Run.Slave[Config.TriggerMasterCrate].in.f, str);
+	sleep(1);
+	for (i=0; i<Config.NSlaves; i++) if (Run.Slave[i].PID) SendScript(Run.Slave[i].in.f, "q");
+	Run.iRun = 0;
 }
 
 /*	Process commands							*/
@@ -432,23 +551,32 @@ static void ProcessCmd(char *cmd)
 			return;
 		}
 		if (num < 0) {
-			for (i=0; i<Config.NSlaves; i++) fprintf(Run.Slave[i].in.f, "%s\r\n", &copy[tok - cmd]);
+			for (i=0; i<Config.NSlaves; i++) if (Run.Slave[i].PID) SendScript(Run.Slave[i].in.f, &copy[tok - cmd]);
 		} else {
-			fprintf(Run.Slave[num].in.f, "%s\r\n", &copy[tok - cmd]);
+			if (Run.Slave[num].PID) SendScript(Run.Slave[num].in.f, &copy[tok - cmd]);
 		}
 	} else if (!strcasecmp(tok, "file")) {	// Open file to write data
+		tok = strtok(NULL, DELIM);
+		OpenDataFile((tok && tok[0]) ? tok : NULL);
 	} else if (!strcasecmp(tok, "help")) {	// Print help
 		Help();
 	} else if (!strcasecmp(tok, "info")) {	// Print statistics
+		Info();
 	} else if (!strcasecmp(tok, "init")) {	// Initialize DAQ
-		for (i=0; i<Config.NSlaves; i++) fprintf(Run.Slave[i].in.f, "%s\r\n", Config.InitScript);
+		if (Run.iRun) StopRun();
+		Init();
 	} else if (!strcasecmp(tok, "list")) {	// List slaves
-		printf("No\tName\n");
-		for (i=0; i<Config.NSlaves; i++) printf("%4d\t%s\n", Config.SlaveList[i]);
+		printf("Configured crates:\n");
+		for (i=0; i<Config.NSlaves; i++) printf("%2d\t%s\t%s\n", i, Config.SlaveList[i], (Run.Slave[i].PID) ? TXT_BOLDGREEN "OK" TXT_NORMAL : TXT_BOLDRED "Disconnected" TXT_NORMAL);
+		printf("Attached connections:\n");
+		for (i=0; i<Run.NCon; i++) printf("%2d\t%s\t%Ld\n", i, My_inet_ntoa(Run.Con[i].ip), Run.Con[i].cnt);
 	} else if (!strcasecmp(tok, "quit")) {	// Quit
 		Run.iStop = 1;
 	} else if (!strcasecmp(tok, "start")) {	// Start DAQ
+		if (!Run.Initialized) Init();
+		if (!Run.iRun) StartRun();
 	} else if (!strcasecmp(tok, "stop")) {	// Stop DAQ
+		if (Run.iRun) StopRun();
 	} else {				// Unknown command
 		printf("Unknown command: %s\n\n", tok);
 		Help();
@@ -469,6 +597,7 @@ int main(int argc, char **argv)
 
 	if (ReadConf((char *)DEFCONFIG)) goto MyExit;
 	if (OpenLog()) goto MyExit;
+	OpenDataFile(NULL);
 
 	theTime = time(NULL);
 	fprintf(Run.fLog, "%sDSINK started.\n", ctime(&theTime));
@@ -480,7 +609,7 @@ int main(int argc, char **argv)
 
 	rl_callback_handler_install("DSINK > ", ProcessCmd);	
 
-	tm.tv_sec = 1;		// 1 s
+	tm.tv_sec = 2;		// 2 s
 	tm.tv_usec = 0;
 
 //		Event loop
@@ -490,25 +619,36 @@ int main(int argc, char **argv)
 		FD_SET(fileno(rl_instream), &set);
 		FD_SET(Run.fdPort, &set);
 		for (i=0; i<Run.NCon; i++) FD_SET(Run.Con[i].fd, &set);
-		for (i=0; i<Config.NSlaves; i++) FD_SET(Run.Slave[i].out.fd[0], &set);
-		for (i=0; i<Config.NSlaves; i++) FD_SET(Run.Slave[i].err.fd[0], &set);
+		for (i=0; i<Config.NSlaves; i++) if (Run.Slave[i].PID) FD_SET(Run.Slave[i].out.fd[0], &set);
+		for (i=0; i<Config.NSlaves; i++) if (Run.Slave[i].PID) FD_SET(Run.Slave[i].err.fd[0], &set);
 
 		irc = select(FD_SETSIZE, &set, NULL, NULL, &tm);
 		if (irc < 0) continue;
 
-		if (FD_ISSET(fileno(rl_instream), &set)) rl_callback_read_char();
-		if (FD_ISSET(Run.fdPort, &set)) {
-			if (Run.NCon < MAXCON) {
-				OpenCon(Run.fdPort, &Run.Con[Run.NCon]);
-				if (Run.Con[Run.NCon].fd > 0) Run.NCon++;
-			} else {
-				DropCon(Run.fdPort);
-			}
+		for (i=0; i<Config.NSlaves; i++) if (Run.Slave[i].PID && waitpid(Run.Slave[i].PID, NULL, WNOHANG)) {
+			printf("\n" TXT_BOLDRED "ERROR: no connection to %s" TXT_NORMAL "\n", Config.SlaveList[i]);
+			fprintf(Run.fLog, "DSINK: no connection to %s\n", Config.SlaveList[i]);
+			Run.Slave[i].PID = 0;
 		}
-		for (i=0; i<Run.NCon; i++) if (FD_ISSET(Run.Con[i].fd, &set)) GetAndWrite(i);
-		for (i=0; i<Config.NSlaves; i++) if (FD_ISSET(Run.Slave[i].out.fd[0], &set)) GetFromSlave(Config.SlaveList[i], Run.Slave[i].out.f);
-		for (i=0; i<Config.NSlaves; i++) if (FD_ISSET(Run.Slave[i].err.fd[0], &set)) GetFromSlave(Config.SlaveList[i], Run.Slave[i].err.f);
-		CleanCon();
+
+		if (irc) {
+
+			if (FD_ISSET(fileno(rl_instream), &set)) rl_callback_read_char();
+			if (FD_ISSET(Run.fdPort, &set)) {
+				if (Run.NCon < MAXCON) {
+					OpenCon(Run.fdPort, &Run.Con[Run.NCon]);
+					if (Run.Con[Run.NCon].fd > 0) Run.NCon++;
+				} else {
+					DropCon(Run.fdPort);
+				}
+			}
+			for (i=0; i<Run.NCon; i++) if (FD_ISSET(Run.Con[i].fd, &set)) GetAndWrite(i);
+			for (i=0; i<Config.NSlaves; i++) if (Run.Slave[i].PID && FD_ISSET(Run.Slave[i].out.fd[0], &set)) GetFromSlave(Config.SlaveList[i], Run.Slave[i].out.f);
+			for (i=0; i<Config.NSlaves; i++) if (Run.Slave[i].PID && FD_ISSET(Run.Slave[i].err.fd[0], &set)) GetFromSlave(Config.SlaveList[i], Run.Slave[i].err.f);
+			CleanCon();
+		} else {
+			FlushEvents();
+		}
 		fflush(Run.fLog);
 	}
 MyExit:
@@ -520,6 +660,7 @@ MyExit:
 
 	CloseSlaves();
 	if (Run.fdPort)	close(Run.fdPort);
+	if (Run.fData) fclose(Run.fData);
 	sleep(2);
 	if (Run.fLog) {
 		fclose(Run.fLog);
