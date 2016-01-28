@@ -14,5 +14,13 @@ struct rec_header_struct {
 #define REC_END		999		// End of file / data from the crate
 #define REC_WFDDATA	0x10000		// Regular wave form data
 
+//	Data block type
+#define TYPE_SELF	0		// Self trigger waveform 
+#define TYPE_MASTER	1		// Master trigger waveform 
+#define TYPE_TRIG	2		// Trigger information
+#define TYPE_RAW	3		// Raw waveform
+#define TYPE_SUM	4		// digital sum of channels waveform 
+#define TYPE_DELIM	5		// synchronisation delimiter
+
 #endif /* RECFORMAT_H */
 

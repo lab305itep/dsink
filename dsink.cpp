@@ -11,6 +11,7 @@
 #include <readline/history.h>
 #include <readline/readline.h>
 #include <signal.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -19,41 +20,9 @@
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
+#include "dsink.h"
+#include "dmodule.h"
 #include "recformat.h"
-
-#define MAXCON	10
-#define MAXSTR	1024
-#define MBYTE	0x100000
-#define DEFCONFIG	"general.conf"
-#define SSH	"/usr/bin/ssh"
-#define SHELL	"/bin/sh"
-#define TXT_BOLDRED	"\033[1;31m"
-#define TXT_BOLDGREEN	"\033[1;32m"
-#define TXT_NORMAL	"\033[0;39m"
-#define DEF_DATAFILE	"defsink.dat"
-
-/*				Types and declarations		*/
-void SendScript(FILE *f, const char *script);
-pid_t StartProcess(char *cmd);
-struct con_struct {
-	int fd;
-	int ip;
-	char *buf;
-	int len;
-	long long cnt;
-	struct rec_header_struct *header;
-};
-struct pipe_struct {
-	int fd[2];
-	FILE* f;
-};
-
-struct slave_struct {
-	pid_t PID;
-	struct pipe_struct in;
-	struct pipe_struct out;
-	struct pipe_struct err;		
-};
 
 /*				Global variables		*/
 struct cfg_struct {
@@ -70,7 +39,7 @@ struct cfg_struct {
 	char InitScript[MAXSTR];	// initialize modules
 	char StartScript[MAXSTR];	// put vme into acquire mode. Agruments: server, port
 	char StopScript[MAXSTR];	// stop acquire mode
-	char InhibitScript[MAXSTR];	// arguments: module number and set/cl
+	char InhibitScript[MAXSTR];	// arguments: module number and set/clear
 } Config;
 
 struct run_struct {
@@ -86,6 +55,7 @@ struct run_struct {
 	int iStop;			// Quit flag
 	int iRun;			// DAQ running flag
 	int Initialized;		// VME modules initialized
+	Dmodule *WFD[MAXWFD];		// class WFD modules for data processing
 } Run;
 
 /*				Functions			*/
@@ -97,20 +67,20 @@ int BindPort(void)
 	
 	fd = socket (PF_INET, SOCK_STREAM, 0);
 	if (fd < 0) {
-		printf("Can not create socket.: %m\n");
+		printf(TXT_FATAL "DSINK: Can not create socket.: %m\n");
 		return fd;
 	}
 	name.sin_family = AF_INET;
 	name.sin_port = htons(Config.Port);
 	name.sin_addr.s_addr = htonl(INADDR_ANY);
 	if (bind(fd, (struct sockaddr *)&name, sizeof(name)) < 0) {
-		printf("Can not bind to port %d: %m\n", Config.Port);
+		printf(TXT_FATAL "DSINK: Can not bind to port %d: %m\n", Config.Port);
 		close(fd);
 		return -1;
 	}
 	
 	if (listen(fd, MAXCON) < 0) {
-		printf("Can not listen to port %d: %m\n", Config.Port);
+		printf(TXT_FATAL "DSINK: Can not listen to port %d: %m\n", Config.Port);
 		close(fd);
 		return -1;
 	}
@@ -155,10 +125,10 @@ void DropCon(int fd)
 	len = sizeof(addr);
 	irc = accept(fd, (struct sockaddr *)&addr, &len);
 	if (irc < 0) {
-		printf("Connection accept error: %m\n");
+		Log(TXT_ERROR "DSINK: Connection accept error: %m\n");
 		return;
 	}
-	printf("Too many connections dropping from %s\n", inet_ntoa(addr.sin_addr));
+	Log(TXT_WARN "DSINK: Too many connections dropping from %s\n", inet_ntoa(addr.sin_addr));
 	close(irc);
 }
 
@@ -177,7 +147,7 @@ void GetAndWrite(int num)
 	if (con->len == 0) {	// getting length
 		irc = read(con->fd, con->buf, sizeof(int));
 		if (irc != sizeof(int) || con->header->len < sizeof(struct rec_header_struct) || con->header->len > MBYTE) {
-			fprintf(Run.fLog, "DSINK: Connection closed or stream data error irc = %d  len = %d from %X %m\n", irc, con->header->len, con->ip);
+			Log(TXT_ERROR "DSINK: Connection closed or stream data error irc = %d  len = %d from %X %m\n", irc, con->header->len, con->ip);
 			free(con->buf);
 			close(con->fd);
 			con->fd = -1;
@@ -187,7 +157,7 @@ void GetAndWrite(int num)
 	} else {		// getting body
 		irc = read(con->fd, &con->buf[con->len], con->header->len - con->len);
 		if (irc <= 0) {
-			fprintf(Run.fLog, "DSINK: Connection closed unexpectingly or stream data error irc = %d at %X %m\n", irc, con->ip);
+			Log(TXT_ERROR "DSINK: Connection closed unexpectingly or stream data error irc = %d at %X %m\n", irc, con->ip);
 			free(con->buf);
 			close(con->fd);
 			con->fd = -1;
@@ -196,7 +166,7 @@ void GetAndWrite(int num)
 		con->len += irc;
 		if (con->len  == con->header->len) {
 			if (con->header->ip != INADDR_LOOPBACK) {
-				fprintf(Run.fLog, "DSINK: Wrong data signature %X - sychronization lost ? @%X\n", con->header->ip, con->ip);
+				Log(TXT_ERROR "DSINK: Wrong data signature %X - sychronization lost ? @%X\n", con->header->ip, con->ip);
 				free(con->buf);
 				close(con->fd);
 				con->fd = -1;
@@ -218,7 +188,7 @@ void GetFromSlave(char *name, FILE *f)
 	char str[MAXSTR];
 	fgets(str, MAXSTR, f);
 	str[MAXSTR-1] = '\0';
-	fprintf(Run.fLog, "%s: %s", name, str);
+	Log(TXT_INFO "%s: %s", name, str);
 }
 
 /*	Print Help								*/
@@ -245,8 +215,26 @@ void Help(void)
 
 void Info(void)
 {
+	int i, j;
+	int *cnt;
+	long BlkCnt;
 	printf("\nSystem Initialization %s done.\n", (Run.Initialized) ? "" : TXT_BOLDRED "not" TXT_NORMAL);
 	if (Run.fData && !Run.iTempData) printf("File: %s\n\t%Ld bytes\n", Run.fDataName, ftello(Run.fData));
+	printf("Modules: ");
+	for (i=0; i<MAXWFD; i++) if (Run.WFD[i]) printf("%d ", i);
+	printf("\n");
+	BlkCnt = 0;
+	for (i=0; i<MAXWFD; i++) if (Run.WFD[i]) {
+		cnt = Run.WFD[i]->GetErrCnt();
+		BlkCnt += Run.WFD[i]->GetBlkCnt();
+		for (j=0; j<=ERR_OTHER; j++) if (cnt[j]) break;
+		if (j <= ERR_OTHER) {
+			printf("Serial %3d Errors: ", i+1);
+			for (j=0; j<=ERR_OTHER; j++) printf((cnt[j]) ? TXT_BOLDRED "%10d " TXT_NORMAL : "%10d ", cnt[j]);
+			printf(" in %10d blocks\n", Run.WFD[i]->GetBlkCnt());
+		}
+	}	
+	printf("Gand total %Ld blocks received.\n", BlkCnt);
 }
 
 void Init(void)
@@ -254,6 +242,23 @@ void Init(void)
 	int i;
 	for (i=0; i<Config.NSlaves; i++) if (Run.Slave[i].PID) SendScript(Run.Slave[i].in.f, Config.InitScript);
 	Run.Initialized = 1;
+}
+
+void Log(const char *msg, ...)
+{
+	char str[MAXSTR];
+	time_t t;
+	FILE *f;
+	va_list ap;
+
+	va_start(ap, msg);
+	t = time(NULL);
+	strftime(str, MAXSTR,"%F %T", localtime(&t));
+	f = (Run.fLog) ? Run.fLog: stdout;
+	fprintf(f, str);
+	vfprintf(f, msg, ap);
+	va_end(ap);
+	fflush(f);
 }
 
 /*	Convert int to inet address						*/
@@ -276,19 +281,19 @@ void OpenCon(int fd, con_struct *con)
 	len = sizeof(addr);
 	irc = accept(fd, (struct sockaddr *)&addr, &len);
 	if (irc < 0) {
-		printf("Connection accept error: %m\n");
+		Log(TXT_ERROR "DSINK: Connection accept error: %m\n");
 		return;
 	}
 	con->buf = (char *)malloc(MBYTE);
 	if (!con->buf) {
-		printf("Can not allocate buffer of %d bytes: %m\n", MBYTE);
+		Log(TXT_ERROR "DSINK: Can not allocate buffer of %d bytes: %m\n", MBYTE);
 		close(irc);
 		return;
 	}
 	con->header = (struct rec_header_struct *) con->buf;
 	con->fd = irc;
 	con->ip = addr.sin_addr.s_addr;
-	printf("connection from %s accepted\n", inet_ntoa(addr.sin_addr));
+	Log(TXT_INFO "DSINK: connection from %s accepted\n", inet_ntoa(addr.sin_addr));
 }
 
 /*	Open file to write data							*/
@@ -308,8 +313,7 @@ void OpenDataFile(char *name)
 	}
 	Run.fData = fopen(Run.fDataName, (Run.iTempData) ? "w" : "a");	// we append to data files, but rewrite the default
 	if (!Run.fData) {
-		printf("\n" TXT_BOLDRED "ERROR: Can not open data file to write: %s (%m)" TXT_NORMAL "\n", Run.fDataName);
-		fprintf(Run.fLog, "DSINK: Can not open data file to write: %s (%m)\n", Run.fDataName);
+		Log(TXT_ERROR "DSINK: Can not open data file to write: %s (%m)\n", Run.fDataName);
 		Run.fDataName[0] = '\0';
 	}
 }
@@ -321,7 +325,7 @@ int OpenLog(void)
 
 	Run.fLog = fopen(Config.LogFile, "at");
 	if (!Run.fLog) {
-		printf("Can not open log-file: %s\n", Config.LogFile);
+		Log(TXT_FATAL "DSINK: Can not open log-file: %s\n", Config.LogFile);
 		return -10;
 	}
 	snprintf(cmd, MAXSTR, Config.LogTermCMD, Config.LogFile);
@@ -338,35 +342,35 @@ int OpenSlaves(void)
 
 	for (i=0; i<Config.NSlaves; i++) {
 		if (TEMP_FAILURE_RETRY(pipe(Run.Slave[i].in.fd))) {
-			fprintf(Run.fLog, "DSINK: Can not create in pipe for %s: %m\n", Config.SlaveList[i]);			
+			Log(TXT_FATAL "DSINK: Can not create in pipe for %s: %m\n", Config.SlaveList[i]);			
 			return -1;
 		}
 		if (TEMP_FAILURE_RETRY(pipe(Run.Slave[i].out.fd))) {
-			fprintf(Run.fLog, "DSINK: Can not create out pipe for %s: %m\n", Config.SlaveList[i]);			
+			Log(TXT_FATAL "DSINK: Can not create out pipe for %s: %m\n", Config.SlaveList[i]);			
 			return -2;
 		}
 		if (TEMP_FAILURE_RETRY(pipe(Run.Slave[i].err.fd))) {
-			fprintf(Run.fLog, "DSINK: Can not create error pipe for %s: %m\n", Config.SlaveList[i]);			
+			Log(TXT_FATAL "DSINK: Can not create error pipe for %s: %m\n", Config.SlaveList[i]);			
 			return -3;
 		}
 		Run.Slave[i].in.f = fdopen(Run.Slave[i].in.fd[1], "w");
 		if (Run.Slave[i].in.f < 0) {
-			fprintf(Run.fLog, "DSINK: fdopen for stdin failed for %s: %m\n", Config.SlaveList[i]);
+			Log(TXT_FATAL "DSINK: fdopen for stdin failed for %s: %m\n", Config.SlaveList[i]);
 			return -30;
 		}
 		Run.Slave[i].out.f = fdopen(Run.Slave[i].out.fd[0], "r");
 		if (Run.Slave[i].out.f < 0) {
-			fprintf(Run.fLog, "DSINK: fdopen for stdout failed for %s: %m\n", Config.SlaveList[i]);
+			Log(TXT_FATAL "DSINK: fdopen for stdout failed for %s: %m\n", Config.SlaveList[i]);
 			return -31;
 		}
 		Run.Slave[i].err.f = fdopen(Run.Slave[i].err.fd[0], "r");
 		if (Run.Slave[i].err.f < 0) {
-			fprintf(Run.fLog, "DSINK: fdopen for stderr failed for %s: %m\n", Config.SlaveList[i]);
+			Log(TXT_FATAL "DSINK: fdopen for stderr failed for %s: %m\n", Config.SlaveList[i]);
 			return -32;
 		}
 		pid = fork();
 		if ((int) pid < 0) {		// error
-			fprintf(Run.fLog, "DSINK: Can not fork for %s: %m\n", Config.SlaveList[i]);			
+			Log(TXT_FATAL "DSINK: Can not fork for %s: %m\n", Config.SlaveList[i]);			
 			return -10;
 		} else if ((int) pid == 0) {	// child process
 			dup2(Run.Slave[i].in.fd[0], STDIN_FILENO);
@@ -379,7 +383,7 @@ int OpenSlaves(void)
 			TEMP_FAILURE_RETRY(close(Run.Slave[i].err.fd[0]));
 			TEMP_FAILURE_RETRY(close(Run.Slave[i].err.fd[1]));
 			execl(SSH, SSH, Config.SlaveList[i], Config.SlaveCMD, NULL);
-			fprintf(Run.fLog, "DSINK: Can not do ssh %s: %s (%m)\n", Config.SlaveList[i], Config.SlaveCMD);	// we shouldn't get here after execl
+			Log(TXT_FATAL "DSINK: Can not do ssh %s: %s (%m)\n", Config.SlaveList[i], Config.SlaveCMD);	// we shouldn't get here after execl
 			exit(-20);
 		} else {			// main process
 			Run.Slave[i].PID = pid;
@@ -398,12 +402,12 @@ int ReadConf(char *fname)
 	int tmp, i;
 	char *stmp;
 	char *tok;
+	config_setting_t *ptr;
 
 	memset(&Config, 0, sizeof(Config));
 	config_init(&cnf);
 	if (config_read_file(&cnf, fname) != CONFIG_TRUE) {
-        	printf("Configuration error in file %s at line %d: %s\n", 
-        		fname, config_error_line(&cnf), config_error_text(&cnf));
+        	Log(TXT_FATAL "DSINK: Configuration error in file %s at line %d: %s\n", fname, config_error_line(&cnf), config_error_text(&cnf));
             	return -10;
     	}
 //	int Port;			// Data port 0xA336
@@ -420,7 +424,7 @@ int ReadConf(char *fname)
 	}
 	Config.NSlaves = i;
 	if (!Config.NSlaves) {
-		printf("Bad configuration %s - no VME crates defined.\n", fname);
+		Log(TXT_FATAL "DSINK: Bad configuration %s - no VME crates defined.\n", fname);
 		return -11;
 	} 
 //	char SlaveCMD[MAXSTR];		// Command to start slave
@@ -430,7 +434,7 @@ int ReadConf(char *fname)
 	tok = strtok(stmp, " \t,:");
 	Config.TriggerMasterCrate = strtol(tok, NULL, 0);
 	if (Config.TriggerMasterCrate < 0 || Config.TriggerMasterCrate >= Config.NSlaves) {
-		printf("Config.TriggerMasterCrate = %d out of range in file %s\n", Config.TriggerMasterCrate, fname);
+		Log(TXT_FATAL "DSINK: Config.TriggerMasterCrate = %d out of range in file %s\n", Config.TriggerMasterCrate, fname);
 		return -12;
 	}
 	tok = strtok(NULL, " \t,:");
@@ -449,7 +453,30 @@ int ReadConf(char *fname)
 	strncpy(Config.StopScript, (config_lookup_string(&cnf, "Sink.StopScript", (const char **) &stmp)) ? stmp : "q", MAXSTR);
 //	char InhibitScript[MAXSTR];	// arguments: module number and set/cl
 	strncpy(Config.InhibitScript, (config_lookup_string(&cnf, "Sink.InhibitScript", (const char **) &stmp)) ? stmp : "m %d %d", MAXSTR);
-
+//	Dmodule *WFD[MAXWFD];		// class WFD modules for data processing
+	ptr = config_lookup(&cnf, "ModuleList");
+	if (!ptr) {
+		Log(TXT_FATAL "DSINK: No modules defined in %s. ModuleList section must be present.\n", fname);
+		return -13;
+	}
+	for (i=0; i<MAXWFD;i++) {
+		tmp = config_setting_get_int_elem(ptr, i);
+		if (tmp <= 0) break;
+		if (tmp >= MAXWFD) {
+			Log(TXT_FATAL "DSINK: Module serial %d out of the range (1-%d).\n", tmp, MAXWFD);
+			return -14;			
+		}
+		try {
+			Run.WFD[tmp-1] = new Dmodule(tmp);
+		}
+		catch (...) {
+			return -15;
+		}
+	}
+	if (!i) {
+		Log(TXT_FATAL "DSINK: ModuleList section is empty in %s.\n", fname);
+		return -16;
+	}
 	return 0;
 }
 
@@ -477,10 +504,10 @@ pid_t StartProcess(char *cmd)
 	pid = fork();
 	if (!pid) {
 		execl(SHELL, SHELL, "-c", cmd, NULL);
-		printf("Wrong return\n");
+		Log(TXT_FATAL "DSINK: Wrong return\n");
 		return -20;
 	} else if (pid < 0) {
-		printf("Can not execute %s\n", cmd);
+		Log(TXT_FATAL "DSINK: Can not execute %s\n", cmd);
 		return pid;
 	}
 	return pid;
@@ -494,8 +521,7 @@ void StartRun(void)
 
 	for (i=0; i<Config.NSlaves; i++) if (!Run.Slave[i].PID) break;
 	if (i != Config.NSlaves) {
-		printf("\n" TXT_BOLDRED "Not all VME crates are attached. Can not start." TXT_NORMAL "\n");
-		fprintf(Run.fLog, "Not all VME crates are attached. Can not start.\n");
+		Log(TXT_ERROR "Not all VME crates are attached. Can not start.\n");
 		return;	
 	}
 	snprintf(str, MAXSTR, Config.StartScript, Config.MyName, Config.Port);
@@ -590,7 +616,6 @@ int main(int argc, char **argv)
 	fd_set set;
 	struct timeval tm;
 	int i, irc;
-	time_t theTime;
 	
 	memset(&Run, 0, sizeof(Run));
 	read_history(".dsink_history");
@@ -599,8 +624,7 @@ int main(int argc, char **argv)
 	if (OpenLog()) goto MyExit;
 	OpenDataFile(NULL);
 
-	theTime = time(NULL);
-	fprintf(Run.fLog, "%sDSINK started.\n", ctime(&theTime));
+	Log(TXT_INFO "DSINK started.\n");
 
 	Run.fdPort = BindPort();
 	if (Run.fdPort < 0) goto MyExit;	
@@ -609,12 +633,12 @@ int main(int argc, char **argv)
 
 	rl_callback_handler_install("DSINK > ", ProcessCmd);	
 
-	tm.tv_sec = 2;		// 2 s
-	tm.tv_usec = 0;
 
 //		Event loop
 	while (!Run.iStop) {
 
+		tm.tv_sec = 2;		// 2 s
+		tm.tv_usec = 0;
 		FD_ZERO(&set);
 		FD_SET(fileno(rl_instream), &set);
 		FD_SET(Run.fdPort, &set);
@@ -626,13 +650,11 @@ int main(int argc, char **argv)
 		if (irc < 0) continue;
 
 		for (i=0; i<Config.NSlaves; i++) if (Run.Slave[i].PID && waitpid(Run.Slave[i].PID, NULL, WNOHANG)) {
-			printf("\n" TXT_BOLDRED "ERROR: no connection to %s" TXT_NORMAL "\n", Config.SlaveList[i]);
-			fprintf(Run.fLog, "DSINK: no connection to %s\n", Config.SlaveList[i]);
+			Log(TXT_ERROR "DSINK: no/lost connection to %s\n", Config.SlaveList[i]);
 			Run.Slave[i].PID = 0;
 		}
 
 		if (irc) {
-
 			if (FD_ISSET(fileno(rl_instream), &set)) rl_callback_read_char();
 			if (FD_ISSET(Run.fdPort, &set)) {
 				if (Run.NCon < MAXCON) {
@@ -649,9 +671,9 @@ int main(int argc, char **argv)
 		} else {
 			FlushEvents();
 		}
-		fflush(Run.fLog);
 	}
 MyExit:
+	Log(TXT_INFO "DSINK: Exit.\n");
 	printf(" Good bye.\n");
 	for (i=0; i<Run.NCon; i++) {
 		free(Run.Con[i].buf);
