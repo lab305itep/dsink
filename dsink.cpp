@@ -173,9 +173,11 @@ void GetAndWrite(int num)
 				return;
 			}
 			con->header->ip = con->ip;
-//			ProcessData(con->buf, con->len);
+			if (con->BlkCnt >= 0 && con->header->cnt != con->BlkCnt + 1) con->ErrCnt++;
+			con->BlkCnt = con->header->cnt;
 			con->len = 0;
 			con->cnt += con->header->len;
+			ProcessData(con->buf);
 			return;
 		}
 	}
@@ -293,6 +295,7 @@ void OpenCon(int fd, con_struct *con)
 	con->header = (struct rec_header_struct *) con->buf;
 	con->fd = irc;
 	con->ip = addr.sin_addr.s_addr;
+	con->BlkCnt = -1;
 	Log(TXT_INFO "DSINK: connection from %s accepted\n", inet_ntoa(addr.sin_addr));
 }
 
@@ -393,6 +396,22 @@ int OpenSlaves(void)
 		}
 	}
 	return 0;
+}
+
+void ProcessData(char *buf)
+{
+	struct rec_header_struct *header;
+	int num;
+	
+	header = (struct rec_header_struct *)buf;
+	if ((header->type & 0xFFFF0000) != REC_WFDDATA) return;	// we ignore other records here
+	num = header->type & REC_SERIALMASK;
+	if (num == 0 || num >= MAXWFD) {
+		Log(TXT_WARN "Out of range module serial number %d met (1-%d)\n", num, MAXWFD);
+		return;
+	}
+	if (!Run.WFD[num]) return;	// we ignore not configured modules
+	Run.WFD[num]->Add(buf, header->len);
 }
 
 /*	Read configuration file							*/
@@ -595,7 +614,7 @@ static void ProcessCmd(char *cmd)
 		printf("Configured crates:\n");
 		for (i=0; i<Config.NSlaves; i++) printf("%2d\t%s\t%s\n", i, Config.SlaveList[i], (Run.Slave[i].PID) ? TXT_BOLDGREEN "OK" TXT_NORMAL : TXT_BOLDRED "Disconnected" TXT_NORMAL);
 		printf("Attached connections:\n");
-		for (i=0; i<Run.NCon; i++) printf("%2d\t%s\t%Ld\n", i, My_inet_ntoa(Run.Con[i].ip), Run.Con[i].cnt);
+		for (i=0; i<Run.NCon; i++) printf("%2d\t%s\t%16Ld bytes %10d blocks %8d errors\n", i, My_inet_ntoa(Run.Con[i].ip), Run.Con[i].cnt, Run.Con[i].BlkCnt, Run.Con[i].ErrCnt);
 	} else if (!strcasecmp(tok, "quit")) {	// Quit
 		Run.iStop = 1;
 	} else if (!strcasecmp(tok, "start")) {	// Start DAQ

@@ -19,7 +19,7 @@ private:
 public:
 	Dmodule(int num);
 	~Dmodule(void);
-	void Add(int *data, int len);	// add data to the buffer
+	void Add(char *data, int len);	// add data to the buffer
 	short int *Get(void);			// return pointer to data block in the buffer. Analyze format errors.
 	inline int *GetErrCnt(void) { return ErrCnt;};
 	inline int GetBlkCnt(void) { return BlkCnt;};

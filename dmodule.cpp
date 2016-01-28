@@ -28,13 +28,13 @@ Dmodule::~Dmodule(void)
 	if (buf) free(buf);
 }
 
-void Dmodule::Add(int *data, int len)
+void Dmodule::Add(char *data, int len)
 {
 	if (wptr + len - sizeof(struct rec_header_struct) > BSIZE) {
 		Log(TXT_ERROR "DSINK: Buffer overflow for module %d\n", Serial);
 		throw -20;
 	} else if (len == sizeof(struct rec_header_struct)) return;
-	memcpy(&buf[wptr >> 1], ((char *) data) + sizeof(struct rec_header_struct), len - sizeof(struct rec_header_struct));
+	memcpy(&buf[wptr >> 1], data + sizeof(struct rec_header_struct), len - sizeof(struct rec_header_struct));
 	wptr += len - sizeof(struct rec_header_struct);
 }
 
@@ -63,12 +63,18 @@ Again:
 		rptr = 0;
 		return NULL;
 	}
-	for (i=0; i<len; i++) if (buf[ptr+i] & 0x8000) break;
+	for (i=0; i<len; i++) if (buf[ptr+i+1] & 0x8000) break;
 	if (i != len) {
-		Log(TXT_WARN "DSINK: Wrong data 0x%4.4X in place of the control word @ %d. WFD %d\n", buf[ptr], ptr*sizeof(short), Serial);
+		Log(TXT_WARN "DSINK: Wrong data 0x%4.4X in place of the control word @ %d. WFD %d\n", buf[ptr+i+1], (ptr+i+1)*sizeof(short), Serial);
 		ErrCnt[ERR_OTHER]++;
-		rptr = (ptr + i)*sizeof(short);
+		rptr = (ptr + i + 1)*sizeof(short);
 		goto Again;
+	}
+	if (buf[ptr+1] && 0x400) {	// this bit must be zero - either by definition or it indicates bad token transmission
+		Log(TXT_WARN "DSINK: token error flagged 0x%4.4X @ %d. WFD %d\n", buf[ptr+1], (ptr+1)*sizeof(short), Serial);
+		ErrCnt[ERR_OTHER]++;
+		rptr = (ptr + len)*sizeof(short);
+		goto Again;		
 	}
 	type = (buf[ptr+1] >> 12) & 7;
 	switch (type) {

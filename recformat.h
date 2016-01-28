@@ -9,10 +9,17 @@ struct rec_header_struct {
 	int time;
 };
 
+//	Record types formed by UFWDTOOL
 #define REC_BEGIN	1		// Begin of file / data from the crate
 #define REC_PSEOC	10		// Marker for the end of pseudo cycle
 #define REC_END		999		// End of file / data from the crate
-#define REC_WFDDATA	0x10000		// Regular wave form data
+#define REC_WFDDATA	0x00010000	// Regular wave form data
+//	Record types formed by DSINK
+#define REC_SELFTRIG	0x01000000	// SelfTrigger
+#define REC_SERIALMASK	0x0000FFFF	// module serial number
+#define REC_CHANMASK	0x00FF0000	// channel mask
+#define REC_EVENT	0x80000000	// Event
+#define REC_EVTCNTMASK	0x7FFFFFFF	// Event counter - the 10 LSB - token
 
 //	Data block type
 #define TYPE_SELF	0		// Self trigger waveform 

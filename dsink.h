@@ -24,6 +24,7 @@
 
 /*				Types and declarations		*/
 void Log(const char *msg, ...) __attribute__ ((format (printf, 1, 2)));
+void ProcessData(char *buf);
 void SendScript(FILE *f, const char *script);
 pid_t StartProcess(char *cmd);
 
@@ -32,7 +33,9 @@ struct con_struct {
 	int ip;
 	char *buf;
 	int len;
-	long long cnt;
+	long cnt;
+	int BlkCnt;
+	int ErrCnt;
 	struct rec_header_struct *header;
 };
 struct pipe_struct {
