@@ -3,6 +3,7 @@
 
 #include <stdio.h>
 #include <unistd.h>
+#include "dmodule.h"
 
 #define MAXCON	10
 #define MAXWFD	70
@@ -23,10 +24,15 @@
 #define DEF_DATAFILE	"defsink.dat"
 
 /*				Types and declarations		*/
+void Add2Event(int num, struct blkinfo_struct *info);
+void CheckReadyEvents(void);
+void FlushEvents(int lToken);
 void Log(const char *msg, ...) __attribute__ ((format (printf, 1, 2)));
+char *My_inet_ntoa(int num);
 void ProcessData(char *buf);
 void SendScript(FILE *f, const char *script);
 pid_t StartProcess(char *cmd);
+void WriteSelfTrig(int num, struct blkinfo_struct *info);
 
 struct con_struct {
 	int fd;
@@ -41,13 +47,15 @@ struct con_struct {
 struct pipe_struct {
 	int fd[2];
 	FILE* f;
+	char buf[MAXSTR];
+	int wptr;
 };
 
 struct slave_struct {
 	pid_t PID;
 	struct pipe_struct in;
 	struct pipe_struct out;
-	struct pipe_struct err;		
+	struct pipe_struct err;
 };
 
 #endif

@@ -40,12 +40,14 @@ struct cfg_struct {
 	char StartScript[MAXSTR];	// put vme into acquire mode. Agruments: server, port
 	char StopScript[MAXSTR];	// stop acquire mode
 	char InhibitScript[MAXSTR];	// arguments: module number and set/clear
+	int MaxEvent;			// Size of Event cache 
 } Config;
 
 struct run_struct {
 	FILE *fLog;			// Log file
 	pid_t fLogPID;			// Log file broser PID
 	FILE *fData;			// Data file
+	struct rec_header_struct fHead;	// record header to write data file
 	char fDataName[MAXSTR];		// Data file name
 	int iTempData;			// Signature of temporary file
 	int fdPort;			// Port for input data connections
@@ -56,9 +58,16 @@ struct run_struct {
 	int iRun;			// DAQ running flag
 	int Initialized;		// VME modules initialized
 	Dmodule *WFD[MAXWFD];		// class WFD modules for data processing
+	unsigned short int **Evt;	// Pointer to event cache
+	int lTokenBase;			// long token of the first even in the cache
 } Run;
 
 /*				Functions			*/
+/*	Add record to the event					*/
+void Add2Event(int num, struct blkinfo_struct *info)
+{
+}
+
 /*	Initialize data connection port				*/
 int BindPort(void)
 {
@@ -88,6 +97,12 @@ int BindPort(void)
 	return fd;
 }
 
+/*	Find mimimal delimiter and look if some of the events 
+	should be written to disk				*/
+void CheckReadyEvents(void)
+{
+}
+
 /*	Clean Con array from closed connections			*/
 void CleanCon(void)
 {
@@ -102,17 +117,18 @@ void CleanCon(void)
 void CloseSlaves(void)
 {
 	int i;
-	for (i=0; i<Config.NSlaves; i++) {
-		if (Run.Slave[i].in.f) {
-			if (Run.Slave[i].PID) {
-				fprintf(Run.Slave[i].in.f, "q\n");
-				fprintf(Run.Slave[i].in.f, "q\n");
-			}
-			fclose(Run.Slave[i].in.f);
+	for (i=0; i<Config.NSlaves; i++) if (Run.Slave[i].in.f) {
+		if (Run.Slave[i].PID) {
+			fprintf(Run.Slave[i].in.f, "q\n");
+			fprintf(Run.Slave[i].in.f, "q\n");
 		}
+		fclose(Run.Slave[i].in.f);
 		if (Run.Slave[i].out.f) fclose(Run.Slave[i].out.f);
 		if (Run.Slave[i].err.f) fclose(Run.Slave[i].err.f);
 	}
+	sleep(1);
+	for (i=0; i<Config.NSlaves; i++) 
+		if (Run.Slave[i].PID && !waitpid(Run.Slave[i].PID, NULL, WNOHANG)) kill(Run.Slave[i].PID, SIGTERM);
 }
 
 /*	Ignore new connection if too many. Should never happen.	*/
@@ -132,8 +148,9 @@ void DropCon(int fd)
 	close(irc);
 }
 
-/*	Consider end of all pending events after select timeout		*/
-void FlushEvents(void)
+/*	Save to disk all events with long token less than lToken	
+	lToken = -1 - all events					*/
+void FlushEvents(int lToken)
 {
 }
 
@@ -146,8 +163,15 @@ void GetAndWrite(int num)
 	con = &Run.Con[num];
 	if (con->len == 0) {	// getting length
 		irc = read(con->fd, con->buf, sizeof(int));
+		if (irc == 0) {
+			Log(TXT_INFO "DSINK: Connection closed from %s\n", My_inet_ntoa(con->ip));
+			free(con->buf);
+			close(con->fd);
+			con->fd = -1;
+			return;			
+		}
 		if (irc != sizeof(int) || con->header->len < sizeof(struct rec_header_struct) || con->header->len > MBYTE) {
-			Log(TXT_ERROR "DSINK: Connection closed or stream data error irc = %d  len = %d from %X %m\n", irc, con->header->len, con->ip);
+			Log(TXT_ERROR "DSINK: Connection closed or stream data error irc = %d  len = %d from %s %m\n", irc, con->header->len, My_inet_ntoa(con->ip));
 			free(con->buf);
 			close(con->fd);
 			con->fd = -1;
@@ -157,7 +181,7 @@ void GetAndWrite(int num)
 	} else {		// getting body
 		irc = read(con->fd, &con->buf[con->len], con->header->len - con->len);
 		if (irc <= 0) {
-			Log(TXT_ERROR "DSINK: Connection closed unexpectingly or stream data error irc = %d at %X %m\n", irc, con->ip);
+			Log(TXT_ERROR "DSINK: Connection closed unexpectingly or stream data error irc = %d at %s %m\n", irc, My_inet_ntoa(con->ip));
 			free(con->buf);
 			close(con->fd);
 			con->fd = -1;
@@ -166,7 +190,7 @@ void GetAndWrite(int num)
 		con->len += irc;
 		if (con->len  == con->header->len) {
 			if (con->header->ip != INADDR_LOOPBACK) {
-				Log(TXT_ERROR "DSINK: Wrong data signature %X - sychronization lost ? @%X\n", con->header->ip, con->ip);
+				Log(TXT_ERROR "DSINK: Wrong data signature %X - sychronization lost ? @ %s\n", con->header->ip, My_inet_ntoa(con->ip));
 				free(con->buf);
 				close(con->fd);
 				con->fd = -1;
@@ -185,12 +209,24 @@ void GetAndWrite(int num)
 }
 
 /*	Get text output from slave and send it to log				*/
-void GetFromSlave(char *name, FILE *f)
+void GetFromSlave(char *name, struct pipe_struct *p)
 {
-	char str[MAXSTR];
-	fgets(str, MAXSTR, f);
-	str[MAXSTR-1] = '\0';
-	Log(TXT_INFO "%s: %s", name, str);
+	char c;
+	c = getc(p->f);
+	if (c == '\0' || c == '\n') {
+		p->buf[p->wptr] = '\n';
+		p->buf[p->wptr+1] = '\0';
+	} else if (p->wptr == MAXSTR - 3) {
+		p->buf[p->wptr] = c;
+		p->buf[p->wptr+1] = '\n';
+		p->buf[p->wptr+2] = '\0';		
+	} else {
+		p->buf[p->wptr] = c;
+		p->wptr++;
+		return;
+	}
+	Log(TXT_INFO "%s: %s", name, p->buf);
+	p->wptr = 0;
 }
 
 /*	Print Help								*/
@@ -221,9 +257,9 @@ void Info(void)
 	int *cnt;
 	long BlkCnt;
 	printf("\nSystem Initialization %s done.\n", (Run.Initialized) ? "" : TXT_BOLDRED "not" TXT_NORMAL);
-	if (Run.fData && !Run.iTempData) printf("File: %s\n\t%Ld bytes\n", Run.fDataName, ftello(Run.fData));
+	if (Run.fData && !Run.iTempData) printf("File: %s\n\t%Ld bytes / %d records\n", Run.fDataName, ftello(Run.fData), Run.fHead.cnt);
 	printf("Modules: ");
-	for (i=0; i<MAXWFD; i++) if (Run.WFD[i]) printf("%d ", i);
+	for (i=0; i<MAXWFD; i++) if (Run.WFD[i]) printf("%d ", i+1);
 	printf("\n");
 	BlkCnt = 0;
 	for (i=0; i<MAXWFD; i++) if (Run.WFD[i]) {
@@ -236,7 +272,7 @@ void Info(void)
 			printf(" in %10d blocks\n", Run.WFD[i]->GetBlkCnt());
 		}
 	}	
-	printf("Gand total %Ld blocks received.\n", BlkCnt);
+	printf("Grand total %Ld blocks received.\n", BlkCnt);
 }
 
 void Init(void)
@@ -256,7 +292,7 @@ void Log(const char *msg, ...)
 	va_start(ap, msg);
 	t = time(NULL);
 	strftime(str, MAXSTR,"%F %T", localtime(&t));
-	f = (Run.fLog) ? Run.fLog: stdout;
+	f = (Run.fLog) ? Run.fLog : stdout;
 	fprintf(f, str);
 	vfprintf(f, msg, ap);
 	va_end(ap);
@@ -318,7 +354,10 @@ void OpenDataFile(char *name)
 	if (!Run.fData) {
 		Log(TXT_ERROR "DSINK: Can not open data file to write: %s (%m)\n", Run.fDataName);
 		Run.fDataName[0] = '\0';
+		return;
 	}
+	Run.fHead.cnt = 0;
+	Run.fHead.ip = INADDR_LOOPBACK;
 }
 
 /*	Open log file and xterm							*/
@@ -356,20 +395,28 @@ int OpenSlaves(void)
 			Log(TXT_FATAL "DSINK: Can not create error pipe for %s: %m\n", Config.SlaveList[i]);			
 			return -3;
 		}
-		Run.Slave[i].in.f = fdopen(Run.Slave[i].in.fd[1], "w");
-		if (Run.Slave[i].in.f < 0) {
+		Run.Slave[i].in.f = fdopen(Run.Slave[i].in.fd[1], "wt");
+		if (!Run.Slave[i].in.f) {
 			Log(TXT_FATAL "DSINK: fdopen for stdin failed for %s: %m\n", Config.SlaveList[i]);
 			return -30;
 		}
-		Run.Slave[i].out.f = fdopen(Run.Slave[i].out.fd[0], "r");
-		if (Run.Slave[i].out.f < 0) {
+		Run.Slave[i].out.f = fdopen(Run.Slave[i].out.fd[0], "rt");
+		if (!Run.Slave[i].out.f) {
 			Log(TXT_FATAL "DSINK: fdopen for stdout failed for %s: %m\n", Config.SlaveList[i]);
 			return -31;
 		}
-		Run.Slave[i].err.f = fdopen(Run.Slave[i].err.fd[0], "r");
-		if (Run.Slave[i].err.f < 0) {
+		Run.Slave[i].err.f = fdopen(Run.Slave[i].err.fd[0], "rt");
+		if (!Run.Slave[i].err.f) {
 			Log(TXT_FATAL "DSINK: fdopen for stderr failed for %s: %m\n", Config.SlaveList[i]);
 			return -32;
+		}
+		if (setvbuf(Run.Slave[i].out.f, NULL, _IONBF, 0)) {
+			Log(TXT_FATAL "DSINK: stdout setting no buffering mode failed for %s: %m\n", Config.SlaveList[i]);
+			return -33;			
+		}
+		if (setvbuf(Run.Slave[i].err.f, NULL, _IONBF, 0)) {
+			Log(TXT_FATAL "DSINK: stderr setting no buffering mode failed for %s: %m\n", Config.SlaveList[i]);
+			return -34;			
 		}
 		pid = fork();
 		if ((int) pid < 0) {		// error
@@ -385,7 +432,7 @@ int OpenSlaves(void)
 			dup2(Run.Slave[i].err.fd[1], STDERR_FILENO);
 			TEMP_FAILURE_RETRY(close(Run.Slave[i].err.fd[0]));
 			TEMP_FAILURE_RETRY(close(Run.Slave[i].err.fd[1]));
-			execl(SSH, SSH, Config.SlaveList[i], Config.SlaveCMD, NULL);
+			execl(SSH, SSH, "-x", Config.SlaveList[i], Config.SlaveCMD, NULL);
 			Log(TXT_FATAL "DSINK: Can not do ssh %s: %s (%m)\n", Config.SlaveList[i], Config.SlaveCMD);	// we shouldn't get here after execl
 			exit(-20);
 		} else {			// main process
@@ -401,6 +448,7 @@ int OpenSlaves(void)
 void ProcessData(char *buf)
 {
 	struct rec_header_struct *header;
+	struct blkinfo_struct *info;
 	int num;
 	
 	header = (struct rec_header_struct *)buf;
@@ -410,8 +458,23 @@ void ProcessData(char *buf)
 		Log(TXT_WARN "Out of range module serial number %d met (1-%d)\n", num, MAXWFD);
 		return;
 	}
-	if (!Run.WFD[num]) return;	// we ignore not configured modules
-	Run.WFD[num]->Add(buf, header->len);
+	if (!Run.WFD[num-1]) return;	// we ignore not configured modules
+	try {
+		Run.WFD[num-1]->Add(buf, header->len);		// store data
+		for (;;) {					// distribute data over events
+			info = Run.WFD[num-1]->Get();
+			if (!info) break;
+			if (info->type == TYPE_SELF) {
+				WriteSelfTrig(num, info);
+			} else {
+				if (info->type == TYPE_DELIM) CheckReadyEvents();
+				Add2Event(num, info);
+			}
+		}
+	} catch (const int irc) {
+		Log(TXT_FATAL "Exception %d signalled.\n", irc);
+		Run.iStop = 1;
+	};
 }
 
 /*	Read configuration file							*/
@@ -496,6 +559,9 @@ int ReadConf(char *fname)
 		Log(TXT_FATAL "DSINK: ModuleList section is empty in %s.\n", fname);
 		return -16;
 	}
+//	int MaxEvent;			// Number of simultaneously allowed events in the builder 
+	Config.MaxEvent = (config_lookup_int(&cnf, "Sink.MaxEvent", &tmp)) ? tmp : 1024;
+	
 	return 0;
 }
 
@@ -548,6 +614,11 @@ void StartRun(void)
 	sleep(1);
 	snprintf(str, MAXSTR, Config.InhibitScript, Config.TriggerMasterModule, 0);
 	SendScript(Run.Slave[Config.TriggerMasterCrate].in.f, str);
+	for (i=0; i<MAXWFD; i++) if (Run.WFD[i]) {
+		Run.WFD[i]->ClearParity();
+		Run.WFD[i]->ClearCounters();		
+	}
+	Run.lTokenBase = 0;
 	Run.iRun = 1;
 }
 
@@ -556,11 +627,31 @@ void StopRun(void)
 {
 	int i;
 	char str[MAXSTR];
+
 	snprintf(str, MAXSTR, Config.InhibitScript, Config.TriggerMasterModule, 1);
 	if (Run.Slave[Config.TriggerMasterCrate].PID) SendScript(Run.Slave[Config.TriggerMasterCrate].in.f, str);
 	sleep(1);
 	for (i=0; i<Config.NSlaves; i++) if (Run.Slave[i].PID) SendScript(Run.Slave[i].in.f, "q");
 	Run.iRun = 0;
+}
+
+/*	Write SelfTrig data to the file						*/
+void WriteSelfTrig(int num, struct blkinfo_struct *info)
+{
+	if (!Run.fData) return;		// nothing to do
+	int irc;
+	Run.fHead.len = sizeof(struct rec_header_struct) + (info->data[0] & 0x1FF) * sizeof(short);
+	Run.fHead.type = REC_SELFTRIG + ((num << 8) & REC_SERIALMASK) + ((info->data[0] >> 9) & REC_CHANMASK);
+	Run.fHead.time = time(NULL);
+	irc = fwrite(&Run.fHead, sizeof(struct rec_header_struct), 1, Run.fData);
+	if (irc != 1) goto Err;
+	irc = fwrite(info->data, (info->data[0] & 0x1FF) * sizeof(short), 1, Run.fData);
+	if (irc != 1) goto Err;
+	return;
+Err:
+	Log(TXT_ERROR "DSINK: Write data file %s failed: %m\n", Run.fDataName);
+	fclose(Run.fData);
+	Run.fData = NULL;
 }
 
 /*	Process commands							*/
@@ -612,9 +703,11 @@ static void ProcessCmd(char *cmd)
 		Init();
 	} else if (!strcasecmp(tok, "list")) {	// List slaves
 		printf("Configured crates:\n");
-		for (i=0; i<Config.NSlaves; i++) printf("%2d\t%s\t%s\n", i, Config.SlaveList[i], (Run.Slave[i].PID) ? TXT_BOLDGREEN "OK" TXT_NORMAL : TXT_BOLDRED "Disconnected" TXT_NORMAL);
+		for (i=0; i<Config.NSlaves; i++) printf("%2d\t%s\t%s\n", i, Config.SlaveList[i], 
+			(Run.Slave[i].PID) ? TXT_BOLDGREEN "OK" TXT_NORMAL : TXT_BOLDRED "Disconnected" TXT_NORMAL);
 		printf("Attached connections:\n");
-		for (i=0; i<Run.NCon; i++) printf("%2d\t%s\t%16Ld bytes %10d blocks %8d errors\n", i, My_inet_ntoa(Run.Con[i].ip), Run.Con[i].cnt, Run.Con[i].BlkCnt, Run.Con[i].ErrCnt);
+		for (i=0; i<Run.NCon; i++) printf("%2d\t%s\t%16Ld bytes %10d blocks %8d errors\n", 
+			i, My_inet_ntoa(Run.Con[i].ip), Run.Con[i].cnt, Run.Con[i].BlkCnt, Run.Con[i].ErrCnt);
 	} else if (!strcasecmp(tok, "quit")) {	// Quit
 		Run.iStop = 1;
 	} else if (!strcasecmp(tok, "start")) {	// Start DAQ
@@ -684,11 +777,13 @@ int main(int argc, char **argv)
 				}
 			}
 			for (i=0; i<Run.NCon; i++) if (FD_ISSET(Run.Con[i].fd, &set)) GetAndWrite(i);
-			for (i=0; i<Config.NSlaves; i++) if (Run.Slave[i].PID && FD_ISSET(Run.Slave[i].out.fd[0], &set)) GetFromSlave(Config.SlaveList[i], Run.Slave[i].out.f);
-			for (i=0; i<Config.NSlaves; i++) if (Run.Slave[i].PID && FD_ISSET(Run.Slave[i].err.fd[0], &set)) GetFromSlave(Config.SlaveList[i], Run.Slave[i].err.f);
+			for (i=0; i<Config.NSlaves; i++) if (Run.Slave[i].PID && FD_ISSET(Run.Slave[i].out.fd[0], &set)) 
+				GetFromSlave(Config.SlaveList[i], &Run.Slave[i].out);
+			for (i=0; i<Config.NSlaves; i++) if (Run.Slave[i].PID && FD_ISSET(Run.Slave[i].err.fd[0], &set)) 
+				GetFromSlave(Config.SlaveList[i], &Run.Slave[i].err);
 			CleanCon();
 		} else {
-			FlushEvents();
+			FlushEvents(-1);
 		}
 	}
 MyExit:
