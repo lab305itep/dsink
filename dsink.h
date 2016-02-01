@@ -9,6 +9,7 @@
 #define MAXWFD	70
 #define MAXSTR	1024
 #define MBYTE	0x100000
+#define MCHUNK	0x10000
 #define DEFCONFIG	"general.conf"
 #define SSH	"/usr/bin/ssh"
 #define SHELL	"/bin/sh"
@@ -21,19 +22,8 @@
 #define TXT_WARN	TXT_BOLDBLUE   " WARN  " TXT_NORMAL
 #define TXT_ERROR	TXT_BOLDYELLOW " ERROR " TXT_NORMAL
 #define TXT_FATAL	TXT_BOLDRED    " FATAL " TXT_NORMAL
-#define DEF_DATAFILE	"defsink.dat"
 
 /*				Types and declarations		*/
-void Add2Event(int num, struct blkinfo_struct *info);
-void CheckReadyEvents(void);
-void FlushEvents(int lToken);
-void Log(const char *msg, ...) __attribute__ ((format (printf, 1, 2)));
-char *My_inet_ntoa(int num);
-void ProcessData(char *buf);
-void SendScript(FILE *f, const char *script);
-pid_t StartProcess(char *cmd);
-void WriteSelfTrig(int num, struct blkinfo_struct *info);
-
 struct con_struct {
 	int fd;
 	int ip;
@@ -57,6 +47,23 @@ struct slave_struct {
 	struct pipe_struct out;
 	struct pipe_struct err;
 };
+
+struct event_struct {
+	char *data;
+	int size;
+	int len;
+};
+
+void Add2Event(int num, struct blkinfo_struct *info);
+void CheckReadyEvents(void);
+void FlushEvents(int lToken);
+void Log(const char *msg, ...) __attribute__ ((format (printf, 1, 2)));
+char *My_inet_ntoa(int num);
+void ProcessData(char *buf);
+void SendScript(FILE *f, const char *script);
+pid_t StartProcess(char *cmd);
+void WriteEvent(int lToken, struct event_struct *event);
+void WriteSelfTrig(int num, struct blkinfo_struct *info);
 
 #endif
 

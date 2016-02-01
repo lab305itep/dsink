@@ -86,11 +86,15 @@ Again:
 	switch (type) {
 	case TYPE_SELF:		// selftrigger
 		if (ChanParity[chan] >= 0 && ChanParity[chan] == parity) {
-			Log(TXT_WARN "DSINK: Channel parity error (possible data loss). Channel %d.%2.2d\n", Serial, chan);
+			Log(TXT_WARN "DSINK: ST. Channel parity error (possible data loss). Channel %d.%2.2d\n", Serial, chan);
 			ErrCnt[ERR_WFDPAR]++;
 		}
-		if (SelfToken[chan] >= 0 && ((SelfToken[chan] + 1) & 0x3FF) != token) {
-			Log(TXT_WARN "DSINK: Self trigger sequential number missing (possible data loss). Channel %d.%2.2d\n", Serial, chan);
+		i = (token - SelfToken[chan] - 1);
+		if (i < 0) i += 1024;
+		if (SelfToken[chan] >= 0 && i > 3) {
+//	This is not an error, because master trigger can overlap and suppress self trigger.
+			Log(TXT_WARN "DSINK: More than 10 self trigger sequential numbers missing: %d/%d (possible data loss). Channel %d.%2.2d\n", 
+				token, SelfToken[chan], Serial, chan);
 			ErrCnt[ERR_SELFTOK]++;
 		}
 		ChanParity[chan] = parity;
@@ -99,7 +103,7 @@ Again:
 	case TYPE_MASTER:	// master trigger
 	case TYPE_RAW:
 		if (ChanParity[chan] >= 0 && ChanParity[chan] == parity) {
-			Log(TXT_WARN "DSINK: Channel parity error (possible data loss). Channel %d.%2.2d\n", Serial, chan);
+			Log(TXT_WARN "DSINK: MT. Channel parity error (possible data loss). Channel %d.%2.2d\n", Serial, chan);
 			ErrCnt[ERR_WFDPAR]++;
 		}
 		ChanParity[chan] = parity;
@@ -142,20 +146,28 @@ Again:
 		break;
 	}
 //		Check for forbidden tokens
-	if ((type == TYPE_MASTER || type == TYPE_RAW || type == TYPE_TRIG || type == TYPE_SUM) && DelimToken >= 0) {
+	if (type == TYPE_MASTER || type == TYPE_RAW || type == TYPE_TRIG || type == TYPE_SUM) {
 		i = 0;
 		switch(DelimToken) {
+		case -1:
+			i = 1;
+			BlkInfo.lToken = token;
+			break;
 		case 0:
 			if (token < 384 || token >= 896) i = 1;	// OK
+			BlkInfo.lToken = (token < 512) ? (SyncCnt << 10) + token : ((SyncCnt-1) << 10) + token;
 			break;
 		case 256:
 			if (token < 640 && token >= 128) i = 1;
+			BlkInfo.lToken = (SyncCnt << 10) + token;
 			break;
 		case 512:
 			if (token < 896 && token >= 384) i = 1;
+			BlkInfo.lToken = (SyncCnt << 10) + token;
 			break;
 		case 768:
 			if (token < 128 || token >= 640) i = 1;
+			BlkInfo.lToken = (token < 512) ? ((SyncCnt+1) << 10) + token : (SyncCnt << 10) + token;
 			break;
 		default:
 			Log(TXT_ERROR "DSINK Internal logical error. DelimToken = %d\n", DelimToken);
@@ -166,12 +178,13 @@ Again:
 			ErrCnt[ERR_OTHER]++;
 			goto Again;
 		}
+	} else if (type == TYPE_DELIM) {
+		BlkInfo.lToken = (SyncCnt << 10) + token;
 	}
 //		Block looks OK now
 	BlkCnt++;
 	BlkInfo.data = &buf[ptr];
 	BlkInfo.type = type;
-	BlkInfo.lToken = (SyncCnt << 10) + token;
 	return &BlkInfo;	
 }
 

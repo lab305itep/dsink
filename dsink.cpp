@@ -7,6 +7,7 @@
 #include <ctype.h>
 #include <errno.h>
 #include <libconfig.h>
+#include <netdb.h>
 #include <netinet/in.h>
 #include <readline/history.h>
 #include <readline/readline.h>
@@ -28,6 +29,8 @@
 struct cfg_struct {
 	int Port;			// Data port 0xA336
 	char MyName[MAXSTR];		// The server host name
+	int UDPPort;			// UDP port  0xA230
+	char UDPHost[MAXSTR];		// Host to send UDP data
 	char SlaveList[MAXCON][MAXSTR];	// Crate host names list
 	int NSlaves;			// number of crates
 	char SlaveCMD[MAXSTR];		// Command to start slave
@@ -39,7 +42,8 @@ struct cfg_struct {
 	char InitScript[MAXSTR];	// initialize modules
 	char StartScript[MAXSTR];	// put vme into acquire mode. Agruments: server, port
 	char StopScript[MAXSTR];	// stop acquire mode
-	char InhibitScript[MAXSTR];	// arguments: module number and set/clear
+	char InhibitScript[MAXSTR];	// Inhibit triggers
+	char EnableScript[MAXSTR];	// Enables triggers
 	int MaxEvent;			// Size of Event cache 
 } Config;
 
@@ -47,8 +51,11 @@ struct run_struct {
 	FILE *fLog;			// Log file
 	pid_t fLogPID;			// Log file broser PID
 	FILE *fData;			// Data file
-	struct rec_header_struct fHead;	// record header to write data file
 	char fDataName[MAXSTR];		// Data file name
+	struct rec_header_struct fHead;	// record header to write data file
+	int fdUDP;			// udp socket to send data for analysis
+	void *wData;			// mememory for write data
+	int wDataSize;			// size of wData 
 	int iTempData;			// Signature of temporary file
 	int fdPort;			// Port for input data connections
 	struct slave_struct Slave[MAXCON];	// Slave VME connections
@@ -58,14 +65,50 @@ struct run_struct {
 	int iRun;			// DAQ running flag
 	int Initialized;		// VME modules initialized
 	Dmodule *WFD[MAXWFD];		// class WFD modules for data processing
-	unsigned short int **Evt;	// Pointer to event cache
+	struct event_struct *Evt;	// Pointer to event cache
+	struct event_struct *EvtCopy;	// Pointer to event cache copy (for rotation)
 	int lTokenBase;			// long token of the first even in the cache
+	int TypeStat[8];		// record types statistics
+	int RecStat[2];			// events/selftriggers in the output file
 } Run;
 
 /*				Functions			*/
 /*	Add record to the event					*/
 void Add2Event(int num, struct blkinfo_struct *info)
 {
+	int k;
+	char *ptr;
+	int new_len;
+
+	// Find our event buffer
+	k = info->lToken - Run.lTokenBase;
+	if (k < 0) {
+		Log(TXT_ERROR "DSINK: Internal error - negative shift in Event cache: long token = %d token base = %d Module %d.\n", 
+			info->lToken, Run.lTokenBase, num);
+		return;
+	}
+	if (k >= Config.MaxEvent) {
+		Log(TXT_ERROR "DSINK: Event cache of %d events looks too small: long token = %d token base = %d Module %d.\n", 
+			Config.MaxEvent, info->lToken, Run.lTokenBase, num);
+		return;
+	}
+	// Check memory
+	new_len = ((info->data[0] & 0x1FF) + 1) * sizeof(short);
+	if (new_len + Run.Evt[k].len > Run.Evt[k].size) {
+		ptr = (char *)realloc(Run.Evt[k].data, Run.Evt[k].size + MCHUNK);
+		if (!ptr) {
+			Log(TXT_ERROR "DSINK: Out of memory: %m\n");
+			return;
+		}
+		Run.Evt[k].data = ptr;
+		Run.Evt[k].size += MCHUNK;
+	}
+	// Put module number in the place of token - 12 LS bits of data[1]
+	info->data[1] &= 0xF000;
+	info->data[1] |= num & 0xFFF;
+	// Store the data
+	memcpy(Run.Evt[k].data + Run.Evt[k].len, info->data, new_len);
+	Run.Evt[k].len += new_len;
 }
 
 /*	Initialize data connection port				*/
@@ -97,10 +140,15 @@ int BindPort(void)
 	return fd;
 }
 
-/*	Find mimimal delimiter and look if some of the events 
-	should be written to disk				*/
+/*	Find mimimal delimiter 					*/
 void CheckReadyEvents(void)
 {
+	int lD;
+	int i;
+
+	lD = 0x7FFFFFFF;	// large positive number
+	for (i=0; i<MAXWFD; i++) if (Run.WFD[i] && Run.WFD[i]->GetLongDelim() < lD) lD = Run.WFD[i]->GetLongDelim();
+	FlushEvents(lD);
 }
 
 /*	Clean Con array from closed connections			*/
@@ -152,6 +200,37 @@ void DropCon(int fd)
 	lToken = -1 - all events					*/
 void FlushEvents(int lToken)
 {
+	int LastEvent;
+	int i;
+	
+	if (lToken == -1) {
+		for (LastEvent = 0; LastEvent < Config.MaxEvent; LastEvent++) if (!Run.Evt[LastEvent].len) break;
+	} else {
+		LastEvent = lToken - 128 - Run.lTokenBase;
+		if (LastEvent <= 0) return;	// nothing to do
+		if (LastEvent > Config.MaxEvent) {
+			Log(TXT_ERROR "DSINK: Internal logic error: lToken(%d) - lTokenBase(%d) > MaxEvent(%d).\n",
+				lToken, Run.lTokenBase, Config.MaxEvent);
+			LastEvent = Config.MaxEvent;
+		}
+	}
+	// Write events
+	for (i=0; i<LastEvent; i++) {
+		if (Run.Evt[i].len) {
+			WriteEvent(Run.lTokenBase + i, &Run.Evt[i]);
+			Run.Evt[i].len = 0;
+		} else {
+			Log(TXT_WARN "DSINK: Empty event with long token %d [arg=%d LastEvent=%d Base=%d]\n", 
+				Run.lTokenBase + i, lToken, LastEvent, Run.lTokenBase);
+		}
+	}
+	// Rotate cache
+	if (LastEvent < Config.MaxEvent) {
+		memcpy(Run.EvtCopy, Run.Evt, Config.MaxEvent * sizeof(struct event_struct));
+		memcpy(Run.Evt, &Run.EvtCopy[LastEvent], (Config.MaxEvent - LastEvent) * sizeof(struct event_struct));
+		memcpy(&Run.Evt[Config.MaxEvent - LastEvent], Run.EvtCopy, LastEvent * sizeof(struct event_struct));
+	}
+	Run.lTokenBase += LastEvent;
 }
 
 /*	Get Data							*/
@@ -171,7 +250,8 @@ void GetAndWrite(int num)
 			return;			
 		}
 		if (irc != sizeof(int) || con->header->len < sizeof(struct rec_header_struct) || con->header->len > MBYTE) {
-			Log(TXT_ERROR "DSINK: Connection closed or stream data error irc = %d  len = %d from %s %m\n", irc, con->header->len, My_inet_ntoa(con->ip));
+			Log(TXT_ERROR "DSINK: Connection closed or stream data error irc = %d  len = %d from %s %m\n", 
+				irc, con->header->len, My_inet_ntoa(con->ip));
 			free(con->buf);
 			close(con->fd);
 			con->fd = -1;
@@ -256,22 +336,34 @@ void Info(void)
 	int i, j;
 	int *cnt;
 	long BlkCnt;
+	int flag;
+	const char type_names[8][8] = {"SELF", "MAST", "TRIG", "RAW ", "HIST", "SYNC", "RSRV", "RSRV"};
+
 	printf("\nSystem Initialization %s done.\n", (Run.Initialized) ? "" : TXT_BOLDRED "not" TXT_NORMAL);
-	if (Run.fData && !Run.iTempData) printf("File: %s\n\t%Ld bytes / %d records\n", Run.fDataName, ftello(Run.fData), Run.fHead.cnt);
+	if (Run.fData && !Run.iTempData) printf("File: %s\n\t%Ld bytes / %d records: %d events + %d SelfTriggers\n", 
+		Run.fDataName, ftello(Run.fData), Run.fHead.cnt, Run.RecStat[0], Run.RecStat[1]);
 	printf("Modules: ");
 	for (i=0; i<MAXWFD; i++) if (Run.WFD[i]) printf("%d ", i+1);
-	printf("\n");
+	printf("\nRecord types: ");
+	for (i=0; i<8; i++) printf("%s: %d  ", type_names[i], Run.TypeStat[i]);
 	BlkCnt = 0;
+	flag = 0;
 	for (i=0; i<MAXWFD; i++) if (Run.WFD[i]) {
 		cnt = Run.WFD[i]->GetErrCnt();
 		BlkCnt += Run.WFD[i]->GetBlkCnt();
 		for (j=0; j<=ERR_OTHER; j++) if (cnt[j]) break;
 		if (j <= ERR_OTHER) {
-			printf("Serial %3d Errors: ", i+1);
+			if (!flag) {
+				printf("Format statistics (errors):\n");
+//					12345671234567890A1234567890A1234567890A1234567890A1234567890A1234567890A
+				printf("Module ChanPar    SumPar     Token      Delimiter  SelfTrig   Other      Blocks\n");
+				flag = 1;
+			}
+			printf(" %3d:  ", i+1);
 			for (j=0; j<=ERR_OTHER; j++) printf((cnt[j]) ? TXT_BOLDRED "%10d " TXT_NORMAL : "%10d ", cnt[j]);
-			printf(" in %10d blocks\n", Run.WFD[i]->GetBlkCnt());
+			printf("%10d\n", Run.WFD[i]->GetBlkCnt());
 		}
-	}	
+	}
 	printf("Grand total %Ld blocks received.\n", BlkCnt);
 }
 
@@ -340,9 +432,11 @@ void OpenDataFile(char *name)
 {
 	Run.fDataName[MAXSTR-1] = '\0';	
 	if (Run.fData) fclose(Run.fData);
-	if (!name) {
-		snprintf(Run.fDataName, MAXSTR, "%s/%s", Config.DataDir, DEF_DATAFILE);
+	Run.fData = NULL;
+	if (!name || !name[0]) {
+		Run.fDataName[0] = '\0';
 		Run.iTempData = 1;
+		return;
 	} else if (name[0] == '/') {
 		strncpy(Run.fDataName, name, MAXSTR);
 		Run.iTempData = 0;
@@ -358,6 +452,7 @@ void OpenDataFile(char *name)
 	}
 	Run.fHead.cnt = 0;
 	Run.fHead.ip = INADDR_LOOPBACK;
+	memset(Run.RecStat, 0, sizeof(Run.RecStat));
 }
 
 /*	Open log file and xterm							*/
@@ -445,6 +540,38 @@ int OpenSlaves(void)
 	return 0;
 }
 
+/*	Create socket for UDP write						*/
+void OpenUDP(void)
+{
+	struct hostent *host;
+	struct sockaddr_in hostname;
+
+	Run.fdUDP = -1;
+	host = gethostbyname(Config.UDPHost);
+	if (!host) {
+		Log(TXT_ERROR "DSINK: Host %s not found (UDP server).\n", Config.UDPHost);
+		return;
+	}
+
+	hostname.sin_family = AF_INET;
+	hostname.sin_port = htons(Config.UDPPort);
+	hostname.sin_addr = *(struct in_addr *) host->h_addr;
+
+	Run.fdUDP = socket(PF_INET, SOCK_DGRAM, 0);
+	if (Run.fdUDP < 0) {
+		Log(TXT_ERROR "DSINK: Can not create socket %s:%d - %m\n", Config.UDPHost, Config.UDPPort);
+		return;
+	}
+
+	if (connect(Run.fdUDP, (struct sockaddr *)&hostname, sizeof(hostname))) {
+		Log(TXT_ERROR "Setting default UDP destination to %s:%d failed %m\n", Config.UDPHost, Config.UDPPort);
+		close(Run.fdUDP);
+		Run.fdUDP = -1;
+		return;
+	}
+}
+
+/*	Process data received							*/
 void ProcessData(char *buf)
 {
 	struct rec_header_struct *header;
@@ -467,9 +594,10 @@ void ProcessData(char *buf)
 			if (info->type == TYPE_SELF) {
 				WriteSelfTrig(num, info);
 			} else {
-				if (info->type == TYPE_DELIM) CheckReadyEvents();
 				Add2Event(num, info);
+				if (info->type == TYPE_DELIM) CheckReadyEvents();
 			}
+			Run.TypeStat[info->type & 7]++;
 		}
 	} catch (const int irc) {
 		Log(TXT_FATAL "Exception %d signalled.\n", irc);
@@ -494,10 +622,15 @@ int ReadConf(char *fname)
     	}
 //	int Port;			// Data port 0xA336
 	Config.Port = (config_lookup_int(&cnf, "Sink.Port", &tmp)) ? tmp : 0xA336;
+//	int UDPPort;			// UDP port 0xA230
+	Config.UDPPort = (config_lookup_int(&cnf, "Sink.UDPPort", &tmp)) ? tmp : 0xA230;
 //	char MyName[MAXSTR];		// The server host name
 	strncpy(Config.MyName, (config_lookup_string(&cnf, "Sink.MyName", (const char **) &stmp)) ? stmp : "dserver.danss.local", MAXSTR);
+//	char UDPHost[MAXSTR];		// host to send UDP data
+	strncpy(Config.UDPHost, (config_lookup_string(&cnf, "Sink.UDPHost", (const char **) &stmp)) ? stmp : "dserver.danss.local", MAXSTR);
 //	char SlaveList[MAXCON][MAXSTR];	// Crate host names list
-	if (!config_lookup_string(&cnf, "Sink.SlaveList", (const char **) &stmp)) stmp = (char *)"vme01.danss.local vme02.danss.local vme03.danss.local vme04.danss.local";
+	if (!config_lookup_string(&cnf, "Sink.SlaveList", (const char **) &stmp)) 
+		stmp = (char *)"vme01.danss.local vme02.danss.local vme03.danss.local vme04.danss.local";
 	tok = strtok(stmp, " \t,");
 	for (i=0; i<MAXCON; i++) {
 		if (!tok || !tok[0]) break;
@@ -524,17 +657,21 @@ int ReadConf(char *fname)
 //	char LogFile[MAXSTR];		// dsink log file name
 	strncpy(Config.LogFile, (config_lookup_string(&cnf, "Sink.LogFile", (const char **) &stmp)) ? stmp : "dsink.log", MAXSTR);
 //	char LogTermCMD[MAXSTR];	// start log view in a separate window
-	strncpy(Config.LogTermCMD, (config_lookup_string(&cnf, "Sink.LogTermCMD", (const char **) &stmp)) ? stmp : "xterm -geometry 240x23 -title DSINK_Log -e tail -f dsink.log", MAXSTR);
+	strncpy(Config.LogTermCMD, (config_lookup_string(&cnf, "Sink.LogTermCMD", 
+		(const char **) &stmp)) ? stmp : "xterm -geometry 240x23 -title DSINK_Log -e tail -f dsink.log", MAXSTR);
 //	char DataDir[MAXSTR];		// directory to write data
 	strncpy(Config.DataDir, (config_lookup_string(&cnf, "Sink.DataDir", (const char **) &stmp)) ? stmp : "data", MAXSTR);
 //	char InitScript[MAXSTR];	// initialize modules
-	strncpy(Config.InitScript, (config_lookup_string(&cnf, "Sink.InitScript", (const char **) &stmp)) ? stmp : "p * main.bin;w 500;i general.conf", MAXSTR);
+	strncpy(Config.InitScript, (config_lookup_string(&cnf, "Sink.InitScript", 
+		(const char **) &stmp)) ? stmp : "p * main.bin;w 500;i general.conf", MAXSTR);
 //	char StartScript[MAXSTR];	// put vme into acquire mode. Agruments: server, port
 	strncpy(Config.StartScript, (config_lookup_string(&cnf, "Sink.StartScript", (const char **) &stmp)) ? stmp : "y * * %s:%d", MAXSTR);
 //	char StopScript[MAXSTR];	// stop acquire mode
 	strncpy(Config.StopScript, (config_lookup_string(&cnf, "Sink.StopScript", (const char **) &stmp)) ? stmp : "q", MAXSTR);
-//	char InhibitScript[MAXSTR];	// arguments: module number and set/cl
-	strncpy(Config.InhibitScript, (config_lookup_string(&cnf, "Sink.InhibitScript", (const char **) &stmp)) ? stmp : "m %d %d", MAXSTR);
+//	char InhibitScript[MAXSTR];
+	strncpy(Config.InhibitScript, (config_lookup_string(&cnf, "Sink.InhibitScript", (const char **) &stmp)) ? stmp : "m %d 1", MAXSTR);
+//	char EnableScript[MAXSTR];
+	strncpy(Config.EnableScript, (config_lookup_string(&cnf, "Sink.EnableScript", (const char **) &stmp)) ? stmp : "z %d;m %d 0", MAXSTR);
 //	Dmodule *WFD[MAXWFD];		// class WFD modules for data processing
 	ptr = config_lookup(&cnf, "ModuleList");
 	if (!ptr) {
@@ -561,7 +698,13 @@ int ReadConf(char *fname)
 	}
 //	int MaxEvent;			// Number of simultaneously allowed events in the builder 
 	Config.MaxEvent = (config_lookup_int(&cnf, "Sink.MaxEvent", &tmp)) ? tmp : 1024;
-	
+	Run.Evt = (struct event_struct *) malloc(Config.MaxEvent * sizeof(struct event_struct));
+	Run.EvtCopy = (struct event_struct *) malloc(Config.MaxEvent * sizeof(struct event_struct));
+	if (!Run.Evt || !Run.EvtCopy) {
+		Log(TXT_FATAL "DSINK: Not enough memory for Event cache %m.\n");
+		return -17;
+	}
+	memset(Run.Evt, 0, Config.MaxEvent * sizeof(struct event_struct));
 	return 0;
 }
 
@@ -577,6 +720,8 @@ void SendScript(FILE *f, const char *script)
 	for (;;) {
 		if (!tok || !tok[0]) break;
 		fprintf(f, "%s\n", tok);
+//		printf("\nSendScript: %s\n", tok);
+		fflush(f);
 		tok = strtok(NULL, ";");
 	}
 }
@@ -609,17 +754,20 @@ void StartRun(void)
 		Log(TXT_ERROR "Not all VME crates are attached. Can not start.\n");
 		return;	
 	}
+	snprintf(str, MAXSTR, Config.InhibitScript, Config.TriggerMasterModule);
+	SendScript(Run.Slave[Config.TriggerMasterCrate].in.f, str);
 	snprintf(str, MAXSTR, Config.StartScript, Config.MyName, Config.Port);
 	for (i=0; i<Config.NSlaves; i++) SendScript(Run.Slave[i].in.f, str);
 	sleep(1);
-	snprintf(str, MAXSTR, Config.InhibitScript, Config.TriggerMasterModule, 0);
+	snprintf(str, MAXSTR, Config.EnableScript, Config.TriggerMasterModule, Config.TriggerMasterModule);
 	SendScript(Run.Slave[Config.TriggerMasterCrate].in.f, str);
 	for (i=0; i<MAXWFD; i++) if (Run.WFD[i]) {
 		Run.WFD[i]->ClearParity();
-		Run.WFD[i]->ClearCounters();		
+		Run.WFD[i]->ClearCounters();
 	}
 	Run.lTokenBase = 0;
 	Run.iRun = 1;
+	memset(Run.TypeStat, 0, sizeof(Run.TypeStat));
 }
 
 /*	Stop DAQ								*/
@@ -628,30 +776,82 @@ void StopRun(void)
 	int i;
 	char str[MAXSTR];
 
-	snprintf(str, MAXSTR, Config.InhibitScript, Config.TriggerMasterModule, 1);
+	snprintf(str, MAXSTR, Config.InhibitScript, Config.TriggerMasterModule);
 	if (Run.Slave[Config.TriggerMasterCrate].PID) SendScript(Run.Slave[Config.TriggerMasterCrate].in.f, str);
 	sleep(1);
 	for (i=0; i<Config.NSlaves; i++) if (Run.Slave[i].PID) SendScript(Run.Slave[i].in.f, "q");
 	Run.iRun = 0;
 }
 
-/*	Write SelfTrig data to the file						*/
+/*	Write and Send data from run.wData. Header MUST correspond to Run.fHead	*/
+void WriteAndSend(void)
+{
+	int irc;
+
+	if (Run.fData) {
+		irc = fwrite(Run.wData, Run.fHead.len, 1, Run.fData);
+		if (irc != 1) {
+			Log(TXT_ERROR "DSINK: Write data file %s failed: %m\n", Run.fDataName);
+			fclose(Run.fData);
+			Run.fData = NULL;
+		}
+	}
+	if (Run.fdUDP >= 0) TEMP_FAILURE_RETRY(write(Run.fdUDP, Run.wData, Run.fHead.len));
+	Run.fHead.cnt++;
+}
+
+/*	Write regular events to the file					*/
+void WriteEvent(int lToken, struct event_struct *event)
+{
+	int len;
+	void *ptr;
+//		Check that we have enough space
+	len = sizeof(struct rec_header_struct) + event->len;
+	if (Run.wDataSize < len) {
+		ptr = realloc(Run.wData, len);
+		if (!ptr) {
+			Log(TXT_ERROR "DSINK: Memory allocation failure of %d bytes in WriteEvent %m.\n", len);
+			return;
+		}
+		Run.wData = ptr;
+		Run.wDataSize = len;
+	}
+//		make the block
+	Run.fHead.len = len;
+	Run.fHead.type = REC_EVENT | (lToken & REC_EVTCNTMASK);
+	Run.fHead.time = time(NULL);
+	memcpy(Run.wData, &Run.fHead, sizeof(struct rec_header_struct));
+	memcpy((char *)Run.wData + sizeof(struct rec_header_struct), event->data, event->len);
+
+	Run.RecStat[0]++;
+	WriteAndSend();
+}
+
+/*	Write SelfTrig data to the file								*/
 void WriteSelfTrig(int num, struct blkinfo_struct *info)
 {
-	if (!Run.fData) return;		// nothing to do
-	int irc;
-	Run.fHead.len = sizeof(struct rec_header_struct) + (info->data[0] & 0x1FF) * sizeof(short);
-	Run.fHead.type = REC_SELFTRIG + ((num << 8) & REC_SERIALMASK) + ((info->data[0] >> 9) & REC_CHANMASK);
+	int len;
+	void *ptr;
+//		Check that we have enough space
+	len = sizeof(struct rec_header_struct) + (info->data[0] & 0x1FF) * sizeof(short);
+	if (Run.wDataSize < len) {
+		ptr = realloc(Run.wData, len);
+		if (!ptr) {
+			Log(TXT_ERROR "DSINK: Memory allocation failure of %d bytes in WriteSelfTrig %m.\n", len);
+			return;
+		}
+		Run.wData = ptr;
+		Run.wDataSize = len;
+	}
+//		Make the block
+	Run.fHead.len = len;
+	Run.fHead.type = REC_SELFTRIG + (num & REC_SERIALMASK) + ((((int)info->data[0]) << 7) & REC_CHANMASK);
 	Run.fHead.time = time(NULL);
-	irc = fwrite(&Run.fHead, sizeof(struct rec_header_struct), 1, Run.fData);
-	if (irc != 1) goto Err;
-	irc = fwrite(info->data, (info->data[0] & 0x1FF) * sizeof(short), 1, Run.fData);
-	if (irc != 1) goto Err;
-	return;
-Err:
-	Log(TXT_ERROR "DSINK: Write data file %s failed: %m\n", Run.fDataName);
-	fclose(Run.fData);
-	Run.fData = NULL;
+	memcpy(Run.wData, &Run.fHead, sizeof(struct rec_header_struct));
+	memcpy((char *)Run.wData + sizeof(struct rec_header_struct), info->data, len - sizeof(struct rec_header_struct));
+
+	Run.RecStat[1]++;
+	WriteAndSend();
 }
 
 /*	Process commands							*/
@@ -734,7 +934,7 @@ int main(int argc, char **argv)
 
 	if (ReadConf((char *)DEFCONFIG)) goto MyExit;
 	if (OpenLog()) goto MyExit;
-	OpenDataFile(NULL);
+	OpenUDP();
 
 	Log(TXT_INFO "DSINK started.\n");
 
@@ -796,7 +996,15 @@ MyExit:
 
 	CloseSlaves();
 	if (Run.fdPort)	close(Run.fdPort);
+	FlushEvents(-1);
+	if (Run.Evt) {
+		for (i=0; i<Config.MaxEvent; i++) if (Run.Evt[i].data) free(Run.Evt[i].data);
+		free(Run.Evt);
+	}
+	if (Run.EvtCopy) free(Run.EvtCopy);
 	if (Run.fData) fclose(Run.fData);
+	if (Run.wData) free(Run.wData);
+	if (Run.fdUDP) close(Run.fdUDP);
 	sleep(2);
 	if (Run.fLog) {
 		fclose(Run.fLog);
