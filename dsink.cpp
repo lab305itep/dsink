@@ -754,6 +754,8 @@ void StartRun(void)
 		Log(TXT_ERROR "Not all VME crates are attached. Can not start.\n");
 		return;	
 	}
+
+	Log(TXT_INFO "DSINK: Executing START command.\n");
 	snprintf(str, MAXSTR, Config.InhibitScript, Config.TriggerMasterModule);
 	SendScript(Run.Slave[Config.TriggerMasterCrate].in.f, str);
 	snprintf(str, MAXSTR, Config.StartScript, Config.MyName, Config.Port);
@@ -776,6 +778,7 @@ void StopRun(void)
 	int i;
 	char str[MAXSTR];
 
+	Log(TXT_INFO "DSINK: Executing STOP command.\n");
 	snprintf(str, MAXSTR, Config.InhibitScript, Config.TriggerMasterModule);
 	if (Run.Slave[Config.TriggerMasterCrate].PID) SendScript(Run.Slave[Config.TriggerMasterCrate].in.f, str);
 	sleep(1);
@@ -833,7 +836,7 @@ void WriteSelfTrig(int num, struct blkinfo_struct *info)
 	int len;
 	void *ptr;
 //		Check that we have enough space
-	len = sizeof(struct rec_header_struct) + (info->data[0] & 0x1FF) * sizeof(short);
+	len = sizeof(struct rec_header_struct) + ((info->data[0] & 0x1FF) + 1) * sizeof(short);
 	if (Run.wDataSize < len) {
 		ptr = realloc(Run.wData, len);
 		if (!ptr) {
@@ -845,7 +848,7 @@ void WriteSelfTrig(int num, struct blkinfo_struct *info)
 	}
 //		Make the block
 	Run.fHead.len = len;
-	Run.fHead.type = REC_SELFTRIG + (num & REC_SERIALMASK) + ((((int)info->data[0]) << 7) & REC_CHANMASK);
+	Run.fHead.type = REC_SELFTRIG + (num & REC_SERIALMASK) + ((((int)info->data[0]) << 7) & 0x3F0000);
 	Run.fHead.time = time(NULL);
 	memcpy(Run.wData, &Run.fHead, sizeof(struct rec_header_struct));
 	memcpy((char *)Run.wData + sizeof(struct rec_header_struct), info->data, len - sizeof(struct rec_header_struct));
