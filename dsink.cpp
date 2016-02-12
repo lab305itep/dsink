@@ -289,9 +289,11 @@ void GetAndWrite(int num)
 }
 
 /*	Get text output from slave and send it to log				*/
-void GetFromSlave(char *name, struct pipe_struct *p)
+void GetFromSlave(char *name, struct pipe_struct *p, struct slave_struct *slave)
 {
 	char c;
+	int irc;
+	
 	c = getc(p->f);
 	if (c == '\0' || c == '\n') {
 		p->buf[p->wptr] = '\n';
@@ -305,7 +307,19 @@ void GetFromSlave(char *name, struct pipe_struct *p)
 		p->wptr++;
 		return;
 	}
-	Log(TXT_INFO "%s: %s", name, p->buf);
+	if (p->buf[0] == '_' && p->buf[1] == ' ') {
+		irc = strtol(&p->buf[2], NULL, 0);
+		slave->IsWaiting = 0;
+		slave->LastResponse = irc;
+		if (irc) {
+			Log(TXT_ERROR "%s: The last command returned an error.\n");
+			slave->CommandFifo[0] = '\0';
+		} else {
+			SendFromFifo(slave);
+		}
+	} else {
+		Log(TXT_INFO "%s: %s", name, p->buf);
+	}
 	p->wptr = 0;
 }
 
@@ -370,7 +384,7 @@ void Info(void)
 void Init(void)
 {
 	int i;
-	for (i=0; i<Config.NSlaves; i++) if (Run.Slave[i].PID) SendScript(Run.Slave[i].in.f, Config.InitScript);
+	for (i=0; i<Config.NSlaves; i++) if (Run.Slave[i].PID) SendScript(&Run.Slave[i], Config.InitScript);
 	Run.Initialized = 1;
 }
 
@@ -708,22 +722,40 @@ int ReadConf(char *fname)
 	return 0;
 }
 
-/*	Send a script divided by semicolons as separate lines to f		*/
-void SendScript(FILE *f, const char *script)
+void SendFromFifo(struct slave_struct *slave)
 {
-	char copy[MAXSTR];
-	char *tok;
+	char *ptr;
 
-	strncpy(copy, script, MAXSTR);
-	tok = strtok(copy, ";");
-
-	for (;;) {
-		if (!tok || !tok[0]) break;
-		fprintf(f, "%s\n", tok);
-//		printf("\nSendScript: %s\n", tok);
-		fflush(f);
-		tok = strtok(NULL, ";");
+	for (ptr = slave->CommandFifo; *ptr; ptr++) {
+		if (ptr[0] == ';') {
+			putc('\n', slave->in.f);
+			if (slave->IsWaiting) break;
+			continue;
+		}
+		putc(ptr[0], slave->in.f);
+		if (ptr[0] == '?') slave->IsWaiting = 1;
 	}
+	if (ptr[0]) {
+		memmove(slave->CommandFifo, ptr, strlen(ptr));
+	} else {
+		putc('\n', slave->in.f);
+		slave->CommandFifo[0] = '\0';
+	}
+	fflush(slave->in.f);
+}
+
+/*	Send a script divided by semicolons as separate lines to f		*/
+void SendScript(struct slave_struct *slave, const char *script)
+{
+	if (strlen(script) + strlen(slave->CommandFifo) > MAXSTR) {
+		Log(TXT_ERROR "DSINK: Command fifo overflow for ssh channel\n");
+		return;
+	}
+	
+	strcat(slave->CommandFifo, ";");
+	strcat(slave->CommandFifo, script);	
+
+	if (!slave->IsWaiting) SendFromFifo(slave);
 }
 
 /*	Spawn a new process and return its PID					*/
@@ -757,12 +789,12 @@ void StartRun(void)
 
 	Log(TXT_INFO "DSINK: Executing START command.\n");
 	snprintf(str, MAXSTR, Config.InhibitScript, Config.TriggerMasterModule);
-	SendScript(Run.Slave[Config.TriggerMasterCrate].in.f, str);
+	SendScript(&Run.Slave[Config.TriggerMasterCrate], str);
 	snprintf(str, MAXSTR, Config.StartScript, Config.MyName, Config.Port);
-	for (i=0; i<Config.NSlaves; i++) SendScript(Run.Slave[i].in.f, str);
+	for (i=0; i<Config.NSlaves; i++) SendScript(&Run.Slave[i], str);
 	sleep(1);
 	snprintf(str, MAXSTR, Config.EnableScript, Config.TriggerMasterModule, Config.TriggerMasterModule);
-	SendScript(Run.Slave[Config.TriggerMasterCrate].in.f, str);
+	SendScript(&Run.Slave[Config.TriggerMasterCrate], str);
 	for (i=0; i<MAXWFD; i++) if (Run.WFD[i]) {
 		Run.WFD[i]->ClearParity();
 		Run.WFD[i]->ClearCounters();
@@ -780,9 +812,9 @@ void StopRun(void)
 
 	Log(TXT_INFO "DSINK: Executing STOP command.\n");
 	snprintf(str, MAXSTR, Config.InhibitScript, Config.TriggerMasterModule);
-	if (Run.Slave[Config.TriggerMasterCrate].PID) SendScript(Run.Slave[Config.TriggerMasterCrate].in.f, str);
+	if (Run.Slave[Config.TriggerMasterCrate].PID) SendScript(&Run.Slave[Config.TriggerMasterCrate], str);
 	sleep(1);
-	for (i=0; i<Config.NSlaves; i++) if (Run.Slave[i].PID) SendScript(Run.Slave[i].in.f, "q");
+	for (i=0; i<Config.NSlaves; i++) if (Run.Slave[i].PID) SendScript(&Run.Slave[i], "q");
 	Run.iRun = 0;
 }
 
@@ -890,9 +922,9 @@ static void ProcessCmd(char *cmd)
 			return;
 		}
 		if (num < 0) {
-			for (i=0; i<Config.NSlaves; i++) if (Run.Slave[i].PID) SendScript(Run.Slave[i].in.f, &copy[tok - cmd]);
+			for (i=0; i<Config.NSlaves; i++) if (Run.Slave[i].PID) SendScript(&Run.Slave[i], &copy[tok - cmd]);
 		} else {
-			if (Run.Slave[num].PID) SendScript(Run.Slave[num].in.f, &copy[tok - cmd]);
+			if (Run.Slave[num].PID) SendScript(&Run.Slave[num], &copy[tok - cmd]);
 		}
 	} else if (!strcasecmp(tok, "file")) {	// Open file to write data
 		tok = strtok(NULL, DELIM);
@@ -981,9 +1013,9 @@ int main(int argc, char **argv)
 			}
 			for (i=0; i<Run.NCon; i++) if (FD_ISSET(Run.Con[i].fd, &set)) GetAndWrite(i);
 			for (i=0; i<Config.NSlaves; i++) if (Run.Slave[i].PID && FD_ISSET(Run.Slave[i].out.fd[0], &set)) 
-				GetFromSlave(Config.SlaveList[i], &Run.Slave[i].out);
+				GetFromSlave(Config.SlaveList[i], &Run.Slave[i].out, &Run.Slave[i]);
 			for (i=0; i<Config.NSlaves; i++) if (Run.Slave[i].PID && FD_ISSET(Run.Slave[i].err.fd[0], &set)) 
-				GetFromSlave(Config.SlaveList[i], &Run.Slave[i].err);
+				GetFromSlave(Config.SlaveList[i], &Run.Slave[i].err, &Run.Slave[i]);
 			CleanCon();
 		} else {
 			FlushEvents(-1);

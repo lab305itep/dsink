@@ -46,6 +46,9 @@ struct slave_struct {
 	struct pipe_struct in;
 	struct pipe_struct out;
 	struct pipe_struct err;
+	char CommandFifo[MAXSTR];
+	int IsWaiting;
+	int LastResponse;
 };
 
 struct event_struct {
@@ -60,7 +63,8 @@ void FlushEvents(int lToken);
 void Log(const char *msg, ...) __attribute__ ((format (printf, 1, 2)));
 char *My_inet_ntoa(int num);
 void ProcessData(char *buf);
-void SendScript(FILE *f, const char *script);
+void SendFromFifo(struct slave_struct *slave);
+void SendScript(struct slave_struct *slave, const char *script);
 pid_t StartProcess(char *cmd);
 void WriteEvent(int lToken, struct event_struct *event);
 void WriteSelfTrig(int num, struct blkinfo_struct *info);
