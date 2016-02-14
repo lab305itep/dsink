@@ -22,6 +22,9 @@
 #define TXT_WARN	TXT_BOLDBLUE   " WARN  " TXT_NORMAL
 #define TXT_ERROR	TXT_BOLDYELLOW " ERROR " TXT_NORMAL
 #define TXT_FATAL	TXT_BOLDRED    " FATAL " TXT_NORMAL
+#define DATA_DIR	"data"
+#define DATA_LOG	"datalog.txt"
+#define GBYTE		((long long) MBYTE << 10)
 
 /*				Types and declarations		*/
 struct con_struct {

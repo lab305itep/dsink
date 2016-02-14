@@ -38,13 +38,16 @@ struct cfg_struct {
 	int TriggerMasterModule;	// Trigger master module
 	char LogFile[MAXSTR];		// dsink log file name
 	char LogTermCMD[MAXSTR];	// start log view in a separate window
-	char DataDir[MAXSTR];		// directory to write data
 	char InitScript[MAXSTR];	// initialize modules
 	char StartScript[MAXSTR];	// put vme into acquire mode. Agruments: server, port
 	char StopScript[MAXSTR];	// stop acquire mode
 	char InhibitScript[MAXSTR];	// Inhibit triggers
 	char EnableScript[MAXSTR];	// Enables triggers
-	int MaxEvent;			// Size of Event cache 
+	int MaxEvent;			// Size of Event cache
+	char CheckDiskScript[MAXSTR];	// the script is called before new file in auto mode is written
+	char AutoName[MAXSTR];		// auto file name format
+	int AutoTime;			// half an hour
+	int AutoSize;			// in GBytes (2^30 bytes)
 } Config;
 
 struct run_struct {
@@ -56,13 +59,13 @@ struct run_struct {
 	int fdUDP;			// udp socket to send data for analysis
 	void *wData;			// mememory for write data
 	int wDataSize;			// size of wData 
-	int iTempData;			// Signature of temporary file
 	int fdPort;			// Port for input data connections
 	struct slave_struct Slave[MAXCON];	// Slave VME connections
 	con_struct Con[MAXCON];		// Data connections
 	int NCon;			// Number of data connections
 	int iStop;			// Quit flag
 	int iRun;			// DAQ running flag
+	int iAuto;			// Auto change file mode
 	int Initialized;		// VME modules initialized
 	Dmodule *WFD[MAXWFD];		// class WFD modules for data processing
 	struct event_struct *Evt;	// Pointer to event cache
@@ -70,6 +73,8 @@ struct run_struct {
 	int lTokenBase;			// long token of the first even in the cache
 	int TypeStat[8];		// record types statistics
 	int RecStat[2];			// events/selftriggers in the output file
+	int LastFileStarted;		// time() when the last file was started
+	long long FileCounter;		// bytes to the last file
 } Run;
 
 /*				Functions			*/
@@ -307,12 +312,12 @@ void GetFromSlave(char *name, struct pipe_struct *p, struct slave_struct *slave)
 		p->wptr++;
 		return;
 	}
-	if (p->buf[0] == '_' && p->buf[1] == ' ') {
+	if (p->buf[0] == '_' && p->buf[1] == '_') {
 		irc = strtol(&p->buf[2], NULL, 0);
 		slave->IsWaiting = 0;
 		slave->LastResponse = irc;
 		if (irc) {
-			Log(TXT_ERROR "%s: The last command returned an error.\n");
+			Log(TXT_ERROR "%s: The last command returned an error.\n", name);
 			slave->CommandFifo[0] = '\0';
 		} else {
 			SendFromFifo(slave);
@@ -321,6 +326,50 @@ void GetFromSlave(char *name, struct pipe_struct *p, struct slave_struct *slave)
 		Log(TXT_INFO "%s: %s", name, p->buf);
 	}
 	p->wptr = 0;
+}
+
+/*	Read log file and find the next auto file number. 
+	Also call the script to check/switch disk.				*/
+int GetNextAutoNumber(void)
+{
+	FILE *f;
+	char str[MAXSTR];
+	int irc;
+	int num;
+	char *ptr;
+
+	//	Get the last line from the data log
+	f = popen("[ -f " DATA_LOG " ] && tail -1 " DATA_LOG, "r");
+	if (!f) {
+		Log(TXT_ERROR "DSINK: Internal error - can not get info from the data log\n");
+		return -1;
+	}
+	irc = fread(str, 1, MAXSTR-1, f);
+	str[irc] = '\0';
+	fclose(f);
+	//	Get file number - the first number in the file name
+	for (ptr = str; ptr[0]; ptr++) if (isdigit(ptr[0])) break;
+	if (ptr[0]) {
+		num = strtol(ptr, NULL, 0);
+	} else {
+		num = 0;
+	}
+	num++;
+	//	Make a file
+	strcpy(str, DATA_DIR);
+	snprintf(&str[strlen(DATA_DIR)], MAXSTR - strlen(DATA_DIR), Config.AutoName, num);
+	//	Check if exists
+	f = fopen(str, "rb");
+	if (f) { 
+		num++;
+		fclose(f);
+	}
+	//	Call disk check/switch script
+	if (Config.CheckDiskScript[0] && system(Config.CheckDiskScript)) {
+		Log(TXT_ERROR "DSINK: disk check error. No Space left ?\n");
+		return -1;
+	}
+	return num;
 }
 
 /*	Print Help								*/
@@ -354,7 +403,7 @@ void Info(void)
 	const char type_names[8][8] = {"SELF", "MAST", "TRIG", "RAW ", "HIST", "SYNC", "RSRV", "RSRV"};
 
 	printf("\nSystem Initialization %s done.\n", (Run.Initialized) ? "" : TXT_BOLDRED "not" TXT_NORMAL);
-	if (Run.fData && !Run.iTempData) printf("File: %s\n\t%Ld bytes / %d records: %d events + %d SelfTriggers\n", 
+	if (Run.fData) printf("File: %s\n\t%Ld bytes / %d records: %d events + %d SelfTriggers\n", 
 		Run.fDataName, ftello(Run.fData), Run.fHead.cnt, Run.RecStat[0], Run.RecStat[1]);
 	printf("Modules: ");
 	for (i=0; i<MAXWFD; i++) if (Run.WFD[i]) printf("%d ", i+1);
@@ -444,29 +493,45 @@ void OpenCon(int fd, con_struct *con)
 /*	Open file to write data							*/
 void OpenDataFile(char *name)
 {
+	char cmd[2*MAXSTR];
+	int irc;
+	
 	Run.fDataName[MAXSTR-1] = '\0';	
-	if (Run.fData) fclose(Run.fData);
+	if (Run.fData) {
+		fclose(Run.fData);
+		if (Run.iAuto) {
+			snprintf(cmd, MAXSTR, "echo %s >> %s", Run.fDataName, DATA_LOG);
+			if (system(cmd)) Log(TXT_ERROR "DSINK: Can not write to " DATA_LOG);
+		}
+	}
 	Run.fData = NULL;
+	Run.iAuto = 0;
 	if (!name || !name[0]) {
 		Run.fDataName[0] = '\0';
-		Run.iTempData = 1;
 		return;
+	} else if (!strcmp(name, "auto")) {
+		irc = GetNextAutoNumber();
+		if (irc < 0) return;	// error message was already printed
+		Run.iAuto = 1;
+		strcpy(Run.fDataName, DATA_DIR "/");
+		snprintf(&Run.fDataName[strlen(DATA_DIR)+1], MAXSTR - strlen(DATA_DIR) - 1, Config.AutoName, irc);
 	} else if (name[0] == '/') {
 		strncpy(Run.fDataName, name, MAXSTR);
-		Run.iTempData = 0;
 	} else {
-		snprintf(Run.fDataName, MAXSTR, "%s/%s", Config.DataDir, name);
-		Run.iTempData = 0;
+		snprintf(Run.fDataName, MAXSTR, "%s/%s", DATA_DIR, name);
 	}
-	Run.fData = fopen(Run.fDataName, (Run.iTempData) ? "w" : "a");	// we append to data files, but rewrite the default
+	Run.fData = fopen(Run.fDataName, "ab");	// we append to data files
 	if (!Run.fData) {
 		Log(TXT_ERROR "DSINK: Can not open data file to write: %s (%m)\n", Run.fDataName);
 		Run.fDataName[0] = '\0';
+		Run.iAuto = 0;		// reset auto flag
 		return;
 	}
 	Run.fHead.cnt = 0;
 	Run.fHead.ip = INADDR_LOOPBACK;
 	memset(Run.RecStat, 0, sizeof(Run.RecStat));
+	Run.LastFileStarted = time(NULL);
+	Run.FileCounter = 0;
 }
 
 /*	Open log file and xterm							*/
@@ -623,7 +688,8 @@ void ProcessData(char *buf)
 int ReadConf(char *fname)
 {
 	config_t cnf;
-	int tmp, i;
+	long tmp;
+	int i;
 	char *stmp;
 	char *tok;
 	config_setting_t *ptr;
@@ -673,8 +739,6 @@ int ReadConf(char *fname)
 //	char LogTermCMD[MAXSTR];	// start log view in a separate window
 	strncpy(Config.LogTermCMD, (config_lookup_string(&cnf, "Sink.LogTermCMD", 
 		(const char **) &stmp)) ? stmp : "xterm -geometry 240x23 -title DSINK_Log -e tail -f dsink.log", MAXSTR);
-//	char DataDir[MAXSTR];		// directory to write data
-	strncpy(Config.DataDir, (config_lookup_string(&cnf, "Sink.DataDir", (const char **) &stmp)) ? stmp : "data", MAXSTR);
 //	char InitScript[MAXSTR];	// initialize modules
 	strncpy(Config.InitScript, (config_lookup_string(&cnf, "Sink.InitScript", 
 		(const char **) &stmp)) ? stmp : "p * main.bin;w 500;i general.conf", MAXSTR);
@@ -719,6 +783,14 @@ int ReadConf(char *fname)
 		return -17;
 	}
 	memset(Run.Evt, 0, Config.MaxEvent * sizeof(struct event_struct));
+//	char CheckDiskScript[MAXSTR];	// the script is called before new file in auto mode is written
+	strncpy(Config.CheckDiskScript, (config_lookup_string(&cnf, "Sink.CheckDiskScript", (const char **) &stmp)) ? stmp : "", MAXSTR);
+//	char AutoName[MAXSTR];		// auto file name format
+	strncpy(Config.AutoName, (config_lookup_string(&cnf, "Sink.AutoName", (const char **) &stmp)) ? stmp : "danss_data_%6.6d.data", MAXSTR);
+//	int AutoTime;			// half an hour
+	Config.AutoTime = (config_lookup_int(&cnf, "Sink.AutoTime", &tmp)) ? tmp : 600;
+//	int AutoSize;			// in GBytes (2^30 bytes)
+	Config.AutoSize = (config_lookup_int(&cnf, "Sink.AutoSize", &tmp)) ? tmp : 10;
 	return 0;
 }
 
@@ -726,6 +798,7 @@ void SendFromFifo(struct slave_struct *slave)
 {
 	char *ptr;
 
+	if (!slave->CommandFifo[0]) return;
 	for (ptr = slave->CommandFifo; *ptr; ptr++) {
 		if (ptr[0] == ';') {
 			putc('\n', slave->in.f);
@@ -736,7 +809,7 @@ void SendFromFifo(struct slave_struct *slave)
 		if (ptr[0] == '?') slave->IsWaiting = 1;
 	}
 	if (ptr[0]) {
-		memmove(slave->CommandFifo, ptr, strlen(ptr));
+		memmove(slave->CommandFifo, ptr, strlen(ptr) + 1);
 	} else {
 		putc('\n', slave->in.f);
 		slave->CommandFifo[0] = '\0';
@@ -818,6 +891,39 @@ void StopRun(void)
 	Run.iRun = 0;
 }
 
+/*	Switch file in the auto mode						*/
+void SwitchAutoFile(void)
+{
+	int irc;
+	char cmd[2*MAXSTR];
+		
+	fclose(Run.fData);
+	snprintf(cmd, MAXSTR, "echo %s >> %s", Run.fDataName, DATA_LOG);
+	if (system(cmd)) Log(TXT_ERROR "DSINK: Can not write to " DATA_LOG);
+
+	irc = GetNextAutoNumber();
+	if (irc < 0) {
+		Run.iAuto = 0;
+		Run.fDataName[0] = '\0';
+		Run.fData = NULL;
+		return;
+	}
+	strcpy(Run.fDataName, DATA_DIR "/");
+	snprintf(&Run.fDataName[strlen(DATA_DIR)+1], MAXSTR - strlen(DATA_DIR) - 1, Config.AutoName, irc);
+	Run.fData = fopen(Run.fDataName, "ab");	// we append to data files
+	if (!Run.fData) {
+		Log(TXT_ERROR "DSINK: Can not open data file to write: %s (%m)\n", Run.fDataName);
+		Run.fDataName[0] = '\0';
+		Run.iAuto = 0;		// reset auto flag
+		return;
+	}
+	Run.fHead.cnt = 0;
+	Run.fHead.ip = INADDR_LOOPBACK;
+	memset(Run.RecStat, 0, sizeof(Run.RecStat));
+	Run.LastFileStarted = time(NULL);
+	Run.FileCounter = 0;
+}
+
 /*	Write and Send data from run.wData. Header MUST correspond to Run.fHead	*/
 void WriteAndSend(void)
 {
@@ -830,6 +936,8 @@ void WriteAndSend(void)
 			fclose(Run.fData);
 			Run.fData = NULL;
 		}
+		Run.FileCounter += Run.fHead.len;
+		if (Run.iAuto && Run.FileCounter > Config.AutoSize * GBYTE) SwitchAutoFile();
 	}
 	if (Run.fdUDP >= 0) TEMP_FAILURE_RETRY(write(Run.fdUDP, Run.wData, Run.fHead.len));
 	Run.fHead.cnt++;
@@ -1020,6 +1128,7 @@ int main(int argc, char **argv)
 		} else {
 			FlushEvents(-1);
 		}
+		if (Run.iAuto && Run.fData && time(NULL) > Run.LastFileStarted + Config.AutoTime) SwitchAutoFile();
 	}
 MyExit:
 	Log(TXT_INFO "DSINK: Exit.\n");
