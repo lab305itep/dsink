@@ -38,16 +38,18 @@ struct cfg_struct {
 	int TriggerMasterModule;	// Trigger master module
 	char LogFile[MAXSTR];		// dsink log file name
 	char LogTermCMD[MAXSTR];	// start log view in a separate window
-	char InitScript[MAXSTR];	// initialize modules
-	char StartScript[MAXSTR];	// put vme into acquire mode. Agruments: server, port
-	char StopScript[MAXSTR];	// stop acquire mode
-	char InhibitScript[MAXSTR];	// Inhibit triggers
-	char EnableScript[MAXSTR];	// Enables triggers
+	char XilinxFirmware[MAXSTR];	// Xilinx firmware
+//	char InitScript[MAXSTR];	// initialize modules
+//	char StartScript[MAXSTR];	// put vme into acquire mode. Agruments: server, port
+//	char StopScript[MAXSTR];	// stop acquire mode
+//	char InhibitScript[MAXSTR];	// Inhibit triggers
+//	char EnableScript[MAXSTR];	// Enables triggers
 	int MaxEvent;			// Size of Event cache
 	char CheckDiskScript[MAXSTR];	// the script is called before new file in auto mode is written
 	char AutoName[MAXSTR];		// auto file name format
 	int AutoTime;			// half an hour
-	int AutoSize;			// in GBytes (2^30 bytes)
+	int AutoSize;			// in MBytes (2^20 bytes)
+	char ConfSavePattern[MAXSTR];	// pattern to copy configuration when dsink reads it
 } Config;
 
 struct run_struct {
@@ -383,7 +385,9 @@ void Help(void)
 	printf("\tinfo - print statistics;\n");
 	printf("\tinit - init vme modules;\n");
 	printf("\tlist - list connected slaves;\n");
+	printf("\tpause - set inhibit;\n");
 	printf("\tquit - Quit;\n");
+	printf("\tresume - clear inhibit;\n");
 	printf("\tstart/stop - start/stop data taking;\n");
 	printf("To write data file example.dat:\n");
 	printf("\tinit\n");
@@ -432,8 +436,11 @@ void Info(void)
 
 void Init(void)
 {
+	char cmd[MAXSTR];
 	int i;
-	for (i=0; i<Config.NSlaves; i++) if (Run.Slave[i].PID) SendScript(&Run.Slave[i], Config.InitScript);
+
+	snprintf(cmd, MAXSTR, "p * %s;?;w 500;i *;?", Config.XilinxFirmware);
+	for (i=0; i<Config.NSlaves; i++) if (Run.Slave[i].PID) SendScript(&Run.Slave[i], cmd);
 	Run.Initialized = 1;
 }
 
@@ -688,16 +695,18 @@ void ProcessData(char *buf)
 int ReadConf(char *fname)
 {
 	config_t cnf;
-	long tmp;
+	int tmp;
 	int i;
 	char *stmp;
 	char *tok;
 	config_setting_t *ptr;
+	char cmd[MAXSTR];
 
 	memset(&Config, 0, sizeof(Config));
 	config_init(&cnf);
 	if (config_read_file(&cnf, fname) != CONFIG_TRUE) {
         	Log(TXT_FATAL "DSINK: Configuration error in file %s at line %d: %s\n", fname, config_error_line(&cnf), config_error_text(&cnf));
+		config_destroy(&cnf);
             	return -10;
     	}
 //	int Port;			// Data port 0xA336
@@ -720,6 +729,7 @@ int ReadConf(char *fname)
 	Config.NSlaves = i;
 	if (!Config.NSlaves) {
 		Log(TXT_FATAL "DSINK: Bad configuration %s - no VME crates defined.\n", fname);
+		config_destroy(&cnf);
 		return -11;
 	} 
 //	char SlaveCMD[MAXSTR];		// Command to start slave
@@ -730,6 +740,7 @@ int ReadConf(char *fname)
 	Config.TriggerMasterCrate = strtol(tok, NULL, 0);
 	if (Config.TriggerMasterCrate < 0 || Config.TriggerMasterCrate >= Config.NSlaves) {
 		Log(TXT_FATAL "DSINK: Config.TriggerMasterCrate = %d out of range in file %s\n", Config.TriggerMasterCrate, fname);
+		config_destroy(&cnf);
 		return -12;
 	}
 	tok = strtok(NULL, " \t,:");
@@ -739,21 +750,24 @@ int ReadConf(char *fname)
 //	char LogTermCMD[MAXSTR];	// start log view in a separate window
 	strncpy(Config.LogTermCMD, (config_lookup_string(&cnf, "Sink.LogTermCMD", 
 		(const char **) &stmp)) ? stmp : "xterm -geometry 240x23 -title DSINK_Log -e tail -f dsink.log", MAXSTR);
+//	char XilinxFirmware[MAXSTR];	// Xilinx firmware
+	strncpy(Config.XilinxFirmware, (config_lookup_string(&cnf, "Sink.XilinxFirmware", (const char **) &stmp)) ? stmp : "", MAXSTR);
 //	char InitScript[MAXSTR];	// initialize modules
-	strncpy(Config.InitScript, (config_lookup_string(&cnf, "Sink.InitScript", 
-		(const char **) &stmp)) ? stmp : "p * main.bin;w 500;i general.conf", MAXSTR);
+//	strncpy(Config.InitScript, (config_lookup_string(&cnf, "Sink.InitScript", 
+//		(const char **) &stmp)) ? stmp : "p * main.bin;w 500;i general.conf", MAXSTR);
 //	char StartScript[MAXSTR];	// put vme into acquire mode. Agruments: server, port
-	strncpy(Config.StartScript, (config_lookup_string(&cnf, "Sink.StartScript", (const char **) &stmp)) ? stmp : "y * * %s:%d", MAXSTR);
+//	strncpy(Config.StartScript, (config_lookup_string(&cnf, "Sink.StartScript", (const char **) &stmp)) ? stmp : "y * * %s:%d", MAXSTR);
 //	char StopScript[MAXSTR];	// stop acquire mode
-	strncpy(Config.StopScript, (config_lookup_string(&cnf, "Sink.StopScript", (const char **) &stmp)) ? stmp : "q", MAXSTR);
+//	strncpy(Config.StopScript, (config_lookup_string(&cnf, "Sink.StopScript", (const char **) &stmp)) ? stmp : "q", MAXSTR);
 //	char InhibitScript[MAXSTR];
-	strncpy(Config.InhibitScript, (config_lookup_string(&cnf, "Sink.InhibitScript", (const char **) &stmp)) ? stmp : "m %d 1", MAXSTR);
+//	strncpy(Config.InhibitScript, (config_lookup_string(&cnf, "Sink.InhibitScript", (const char **) &stmp)) ? stmp : "m %d 1", MAXSTR);
 //	char EnableScript[MAXSTR];
-	strncpy(Config.EnableScript, (config_lookup_string(&cnf, "Sink.EnableScript", (const char **) &stmp)) ? stmp : "z %d;m %d 0", MAXSTR);
+//	strncpy(Config.EnableScript, (config_lookup_string(&cnf, "Sink.EnableScript", (const char **) &stmp)) ? stmp : "z %d;m %d 0", MAXSTR);
 //	Dmodule *WFD[MAXWFD];		// class WFD modules for data processing
 	ptr = config_lookup(&cnf, "ModuleList");
 	if (!ptr) {
 		Log(TXT_FATAL "DSINK: No modules defined in %s. ModuleList section must be present.\n", fname);
+		config_destroy(&cnf);
 		return -13;
 	}
 	for (i=0; i<MAXWFD;i++) {
@@ -761,17 +775,20 @@ int ReadConf(char *fname)
 		if (tmp <= 0) break;
 		if (tmp >= MAXWFD) {
 			Log(TXT_FATAL "DSINK: Module serial %d out of the range (1-%d).\n", tmp, MAXWFD);
+			config_destroy(&cnf);
 			return -14;			
 		}
 		try {
 			Run.WFD[tmp-1] = new Dmodule(tmp);
 		}
 		catch (...) {
+			config_destroy(&cnf);
 			return -15;
 		}
 	}
 	if (!i) {
 		Log(TXT_FATAL "DSINK: ModuleList section is empty in %s.\n", fname);
+		config_destroy(&cnf);
 		return -16;
 	}
 //	int MaxEvent;			// Number of simultaneously allowed events in the builder 
@@ -780,6 +797,7 @@ int ReadConf(char *fname)
 	Run.EvtCopy = (struct event_struct *) malloc(Config.MaxEvent * sizeof(struct event_struct));
 	if (!Run.Evt || !Run.EvtCopy) {
 		Log(TXT_FATAL "DSINK: Not enough memory for Event cache %m.\n");
+		config_destroy(&cnf);
 		return -17;
 	}
 	memset(Run.Evt, 0, Config.MaxEvent * sizeof(struct event_struct));
@@ -789,8 +807,15 @@ int ReadConf(char *fname)
 	strncpy(Config.AutoName, (config_lookup_string(&cnf, "Sink.AutoName", (const char **) &stmp)) ? stmp : "danss_data_%6.6d.data", MAXSTR);
 //	int AutoTime;			// half an hour
 	Config.AutoTime = (config_lookup_int(&cnf, "Sink.AutoTime", &tmp)) ? tmp : 600;
-//	int AutoSize;			// in GBytes (2^30 bytes)
+//	int AutoSize;			// in MBytes (2^20 bytes)
 	Config.AutoSize = (config_lookup_int(&cnf, "Sink.AutoSize", &tmp)) ? tmp : 10;
+//	char ConfSavePattern[MAXSTR];	// pattern to copy configuration when dsink reads it
+	strncpy(Config.ConfSavePattern, (config_lookup_string(&cnf, "Sink.ConfSavePattern", (const char **) &stmp)) ? stmp : "", MAXSTR);
+	if (strlen(Config.ConfSavePattern)) {
+		snprintf(cmd, MAXSTR, "cp %s %s", fname, Config.ConfSavePattern);
+		system(cmd);
+	}
+	config_destroy(&cnf);
 	return 0;
 }
 
@@ -831,6 +856,18 @@ void SendScript(struct slave_struct *slave, const char *script)
 	if (!slave->IsWaiting) SendFromFifo(slave);
 }
 
+/*	Set/Clear Inhibit on the main trigger module				*/
+void SetInhibit(int what)
+{
+	char str[MAXSTR];
+	if (!Run.Slave[Config.TriggerMasterCrate].PID) {
+		Log(TXT_ERROR "DSINK: No communication to Master module VME crate.\n");
+		return;
+	}
+	snprintf(str, MAXSTR, "m %d %d;?", Config.TriggerMasterModule, (what) ? 1 : 0);	
+	SendScript(&Run.Slave[Config.TriggerMasterCrate], str);
+}
+
 /*	Spawn a new process and return its PID					*/
 pid_t StartProcess(char *cmd)
 {
@@ -856,18 +893,25 @@ void StartRun(void)
 
 	for (i=0; i<Config.NSlaves; i++) if (!Run.Slave[i].PID) break;
 	if (i != Config.NSlaves) {
-		Log(TXT_ERROR "Not all VME crates are attached. Can not start.\n");
+		Log(TXT_ERROR "DSINK: Not all VME crates are attached. Can not start.\n");
 		return;	
 	}
 
 	Log(TXT_INFO "DSINK: Executing START command.\n");
-	snprintf(str, MAXSTR, Config.InhibitScript, Config.TriggerMasterModule);
-	SendScript(&Run.Slave[Config.TriggerMasterCrate], str);
-	snprintf(str, MAXSTR, Config.StartScript, Config.MyName, Config.Port);
+	SetInhibit(1);
+	snprintf(str, MAXSTR, "y * * %s:%d;?", Config.MyName, Config.Port);
 	for (i=0; i<Config.NSlaves; i++) SendScript(&Run.Slave[i], str);
+/*	for (i=0; i<Config.NSlaves; i++) while (Run.Slave[i].IsWaiting);
+	for (i=0; i<Config.NSlaves; i++) if (Run.Slave[i].LastResponse) break;
+	if (i != Config.NSlaves) {
+		Log(TXT_ERROR "DSINK: Can not start the run - check VME responses.\n");
+		return;
+	}
+*/
 	sleep(1);
-	snprintf(str, MAXSTR, Config.EnableScript, Config.TriggerMasterModule, Config.TriggerMasterModule);
+	snprintf(str, MAXSTR, "z %d", Config.TriggerMasterModule);
 	SendScript(&Run.Slave[Config.TriggerMasterCrate], str);
+	SetInhibit(0);
 	for (i=0; i<MAXWFD; i++) if (Run.WFD[i]) {
 		Run.WFD[i]->ClearParity();
 		Run.WFD[i]->ClearCounters();
@@ -884,8 +928,19 @@ void StopRun(void)
 	char str[MAXSTR];
 
 	Log(TXT_INFO "DSINK: Executing STOP command.\n");
-	snprintf(str, MAXSTR, Config.InhibitScript, Config.TriggerMasterModule);
-	if (Run.Slave[Config.TriggerMasterCrate].PID) SendScript(&Run.Slave[Config.TriggerMasterCrate], str);
+	if (Run.iAuto) {
+		Run.fDataName[MAXSTR-1] = '\0';	
+		if (Run.fData) {
+			fclose(Run.fData);
+			if (Run.iAuto) {
+				snprintf(str, MAXSTR, "echo %s >> %s", Run.fDataName, DATA_LOG);
+				if (system(str)) Log(TXT_ERROR "DSINK: Can not write to " DATA_LOG);
+			}
+			Run.fData = NULL;
+		}
+	}
+
+	SetInhibit(1);
 	sleep(1);
 	for (i=0; i<Config.NSlaves; i++) if (Run.Slave[i].PID) SendScript(&Run.Slave[i], "q");
 	Run.iRun = 0;
@@ -896,7 +951,8 @@ void SwitchAutoFile(void)
 {
 	int irc;
 	char cmd[2*MAXSTR];
-		
+	
+	SetInhibit(1);
 	fclose(Run.fData);
 	snprintf(cmd, MAXSTR, "echo %s >> %s", Run.fDataName, DATA_LOG);
 	if (system(cmd)) Log(TXT_ERROR "DSINK: Can not write to " DATA_LOG);
@@ -922,6 +978,7 @@ void SwitchAutoFile(void)
 	memset(Run.RecStat, 0, sizeof(Run.RecStat));
 	Run.LastFileStarted = time(NULL);
 	Run.FileCounter = 0;
+	SetInhibit(0);
 }
 
 /*	Write and Send data from run.wData. Header MUST correspond to Run.fHead	*/
@@ -937,7 +994,7 @@ void WriteAndSend(void)
 			Run.fData = NULL;
 		}
 		Run.FileCounter += Run.fHead.len;
-		if (Run.iAuto && Run.FileCounter > Config.AutoSize * GBYTE) SwitchAutoFile();
+		if (Run.iAuto && Run.FileCounter > (long long) Config.AutoSize * MBYTE) SwitchAutoFile();
 	}
 	if (Run.fdUDP >= 0) TEMP_FAILURE_RETRY(write(Run.fdUDP, Run.wData, Run.fHead.len));
 	Run.fHead.cnt++;
@@ -1051,8 +1108,12 @@ static void ProcessCmd(char *cmd)
 		printf("Attached connections:\n");
 		for (i=0; i<Run.NCon; i++) printf("%2d\t%s\t%16Ld bytes %10d blocks %8d errors\n", 
 			i, My_inet_ntoa(Run.Con[i].ip), Run.Con[i].cnt, Run.Con[i].BlkCnt, Run.Con[i].ErrCnt);
+	} else if (!strcasecmp(tok, "pause")) {	// Pause
+		SetInhibit(1);
 	} else if (!strcasecmp(tok, "quit")) {	// Quit
 		Run.iStop = 1;
+	} else if (!strcasecmp(tok, "resume")) {// Resume
+		SetInhibit(0);
 	} else if (!strcasecmp(tok, "start")) {	// Start DAQ
 		if (!Run.Initialized) Init();
 		if (!Run.iRun) StartRun();
