@@ -50,6 +50,7 @@ struct cfg_struct {
 	int AutoTime;			// half an hour
 	int AutoSize;			// in MBytes (2^20 bytes)
 	char ConfSavePattern[MAXSTR];	// pattern to copy configuration when dsink reads it
+	char LogSavePattern[MAXSTR];	// Pattern to rename the old log file before compression
 } Config;
 
 struct run_struct {
@@ -168,6 +169,20 @@ void CleanCon(void)
 	}
 }
 
+/*	Close Data File						*/
+void CloseDataFile(void)
+{
+	char cmd[MAXSTR];
+
+	if (!Run.fData) return;
+	fclose(Run.fData);
+	snprintf(cmd, MAXSTR, "echo %s >> %s", Run.fDataName, DATA_LOG);
+	if (system(cmd)) Log(TXT_ERROR "DSINK: Can not write to " DATA_LOG);
+	Log(TXT_INFO "DSINK: File %s closed. %d events, %d SelfTriggers, %Ld bytes in %d s.\n",
+		Run.fDataName, Run.RecStat[0], Run.RecStat[1], Run.FileCounter, time(NULL) - Run.LastFileStarted);
+	Run.fData = NULL;
+}
+
 /*	Close command connections						*/
 void CloseSlaves(void)
 {
@@ -184,6 +199,51 @@ void CloseSlaves(void)
 	sleep(1);
 	for (i=0; i<Config.NSlaves; i++) 
 		if (Run.Slave[i].PID && !waitpid(Run.Slave[i].PID, NULL, WNOHANG)) kill(Run.Slave[i].PID, SIGTERM);
+}
+
+/*	Select get events once							*/
+void DoSelect(int AcceptCommands)
+{
+	fd_set set;
+	struct timeval tm;
+	int i, irc;
+	
+	tm.tv_sec = 2;		// 2 s
+	tm.tv_usec = 0;
+	FD_ZERO(&set);
+	if (AcceptCommands) FD_SET(fileno(rl_instream), &set);
+	FD_SET(Run.fdPort, &set);
+	for (i=0; i<Run.NCon; i++) FD_SET(Run.Con[i].fd, &set);
+	for (i=0; i<Config.NSlaves; i++) if (Run.Slave[i].PID) FD_SET(Run.Slave[i].out.fd[0], &set);
+	for (i=0; i<Config.NSlaves; i++) if (Run.Slave[i].PID) FD_SET(Run.Slave[i].err.fd[0], &set);
+
+	irc = select(FD_SETSIZE, &set, NULL, NULL, &tm);
+	if (irc < 0) return;
+
+	for (i=0; i<Config.NSlaves; i++) if (Run.Slave[i].PID && waitpid(Run.Slave[i].PID, NULL, WNOHANG)) {
+		Log(TXT_ERROR "DSINK: no/lost connection to %s\n", Config.SlaveList[i]);
+		Run.Slave[i].PID = 0;
+	}
+
+	if (irc) {
+		if (AcceptCommands) if (FD_ISSET(fileno(rl_instream), &set)) rl_callback_read_char();
+		if (FD_ISSET(Run.fdPort, &set)) {
+			if (Run.NCon < MAXCON) {
+				OpenCon(Run.fdPort, &Run.Con[Run.NCon]);
+				if (Run.Con[Run.NCon].fd > 0) Run.NCon++;
+			} else {
+				DropCon(Run.fdPort);
+			}
+		}
+		for (i=0; i<Run.NCon; i++) if (FD_ISSET(Run.Con[i].fd, &set)) GetAndWrite(i);
+		for (i=0; i<Config.NSlaves; i++) if (Run.Slave[i].PID && FD_ISSET(Run.Slave[i].out.fd[0], &set)) 
+			GetFromSlave(Config.SlaveList[i], &Run.Slave[i].out, &Run.Slave[i]);
+		for (i=0; i<Config.NSlaves; i++) if (Run.Slave[i].PID && FD_ISSET(Run.Slave[i].err.fd[0], &set)) 
+			GetFromSlave(Config.SlaveList[i], &Run.Slave[i].err, &Run.Slave[i]);
+			CleanCon();
+	} else {
+		FlushEvents(-1);
+	}
 }
 
 /*	Ignore new connection if too many. Should never happen.	*/
@@ -352,18 +412,18 @@ int GetNextAutoNumber(void)
 	//	Get file number - the first number in the file name
 	for (ptr = str; ptr[0]; ptr++) if (isdigit(ptr[0])) break;
 	if (ptr[0]) {
-		num = strtol(ptr, NULL, 0);
+		num = strtol(ptr, NULL, 10);
 	} else {
 		num = 0;
 	}
 	num++;
 	//	Make a file
-	strcpy(str, DATA_DIR);
-	snprintf(&str[strlen(DATA_DIR)], MAXSTR - strlen(DATA_DIR), Config.AutoName, num);
+	for (;;num++) {
+		strcpy(str, DATA_DIR);
+		snprintf(&str[strlen(DATA_DIR)], MAXSTR - strlen(DATA_DIR), Config.AutoName, num);
 	//	Check if exists
-	f = fopen(str, "rb");
-	if (f) { 
-		num++;
+		f = fopen(str, "rb");
+		if (!f) break; 
 		fclose(f);
 	}
 	//	Call disk check/switch script
@@ -402,17 +462,18 @@ void Info(void)
 {
 	int i, j;
 	int *cnt;
-	long BlkCnt;
+	long long BlkCnt;
 	int flag;
 	const char type_names[8][8] = {"SELF", "MAST", "TRIG", "RAW ", "HIST", "SYNC", "RSRV", "RSRV"};
 
-	printf("\nSystem Initialization %s done.\n", (Run.Initialized) ? "" : TXT_BOLDRED "not" TXT_NORMAL);
-	if (Run.fData) printf("File: %s\n\t%Ld bytes / %d records: %d events + %d SelfTriggers\n", 
-		Run.fDataName, ftello(Run.fData), Run.fHead.cnt, Run.RecStat[0], Run.RecStat[1]);
+	printf("System Initialization %s done.\n", (Run.Initialized) ? "" : TXT_BOLDRED "not" TXT_NORMAL);
+	if (Run.fData) printf("File: %s: %Ld bytes / %d records: %d events + %d SelfTriggers / %d s\n", 
+		Run.fDataName, ftello(Run.fData), Run.fHead.cnt, Run.RecStat[0], Run.RecStat[1], time(NULL) - Run.LastFileStarted);
 	printf("Modules: ");
 	for (i=0; i<MAXWFD; i++) if (Run.WFD[i]) printf("%d ", i+1);
 	printf("\nRecord types: ");
 	for (i=0; i<8; i++) printf("%s: %d  ", type_names[i], Run.TypeStat[i]);
+	printf("\n");
 	BlkCnt = 0;
 	flag = 0;
 	for (i=0; i<MAXWFD; i++) if (Run.WFD[i]) {
@@ -503,14 +564,8 @@ void OpenDataFile(char *name)
 	char cmd[2*MAXSTR];
 	int irc;
 	
+	CloseDataFile();
 	Run.fDataName[MAXSTR-1] = '\0';	
-	if (Run.fData) {
-		fclose(Run.fData);
-		if (Run.iAuto) {
-			snprintf(cmd, MAXSTR, "echo %s >> %s", Run.fDataName, DATA_LOG);
-			if (system(cmd)) Log(TXT_ERROR "DSINK: Can not write to " DATA_LOG);
-		}
-	}
 	Run.fData = NULL;
 	Run.iAuto = 0;
 	if (!name || !name[0]) {
@@ -520,12 +575,12 @@ void OpenDataFile(char *name)
 		irc = GetNextAutoNumber();
 		if (irc < 0) return;	// error message was already printed
 		Run.iAuto = 1;
-		strcpy(Run.fDataName, DATA_DIR "/");
-		snprintf(&Run.fDataName[strlen(DATA_DIR)+1], MAXSTR - strlen(DATA_DIR) - 1, Config.AutoName, irc);
+		strcpy(Run.fDataName, DATA_DIR);
+		snprintf(&Run.fDataName[strlen(DATA_DIR)], MAXSTR - strlen(DATA_DIR), Config.AutoName, irc);
 	} else if (name[0] == '/') {
 		strncpy(Run.fDataName, name, MAXSTR);
 	} else {
-		snprintf(Run.fDataName, MAXSTR, "%s/%s", DATA_DIR, name);
+		snprintf(Run.fDataName, MAXSTR, "%s%s", DATA_DIR, name);
 	}
 	Run.fData = fopen(Run.fDataName, "ab");	// we append to data files
 	if (!Run.fData) {
@@ -815,6 +870,12 @@ int ReadConf(char *fname)
 		snprintf(cmd, MAXSTR, "cp %s %s", fname, Config.ConfSavePattern);
 		system(cmd);
 	}
+//	LogSavePattern="history/log_`date +%F_%H%M`.log";	// Pattern to rename the old log file before compression
+	strncpy(Config.LogSavePattern, (config_lookup_string(&cnf, "Sink.LogSavePattern", (const char **) &stmp)) ? stmp : "", MAXSTR);
+	if (strlen(Config.LogSavePattern)) {
+		snprintf(cmd, MAXSTR, "f=%s;mv %s $f;bzip2 $f&", Config.LogSavePattern, Config.LogFile);
+		system(cmd);
+	}	
 	config_destroy(&cnf);
 	return 0;
 }
@@ -929,15 +990,8 @@ void StopRun(void)
 
 	Log(TXT_INFO "DSINK: Executing STOP command.\n");
 	if (Run.iAuto) {
+		CloseDataFile();
 		Run.fDataName[MAXSTR-1] = '\0';	
-		if (Run.fData) {
-			fclose(Run.fData);
-			if (Run.iAuto) {
-				snprintf(str, MAXSTR, "echo %s >> %s", Run.fDataName, DATA_LOG);
-				if (system(str)) Log(TXT_ERROR "DSINK: Can not write to " DATA_LOG);
-			}
-			Run.fData = NULL;
-		}
 	}
 
 	SetInhibit(1);
@@ -950,12 +1004,10 @@ void StopRun(void)
 void SwitchAutoFile(void)
 {
 	int irc;
-	char cmd[2*MAXSTR];
 	
-	SetInhibit(1);
-	fclose(Run.fData);
-	snprintf(cmd, MAXSTR, "echo %s >> %s", Run.fDataName, DATA_LOG);
-	if (system(cmd)) Log(TXT_ERROR "DSINK: Can not write to " DATA_LOG);
+//	SetInhibit(1);
+
+	CloseDataFile();
 
 	irc = GetNextAutoNumber();
 	if (irc < 0) {
@@ -964,8 +1016,8 @@ void SwitchAutoFile(void)
 		Run.fData = NULL;
 		return;
 	}
-	strcpy(Run.fDataName, DATA_DIR "/");
-	snprintf(&Run.fDataName[strlen(DATA_DIR)+1], MAXSTR - strlen(DATA_DIR) - 1, Config.AutoName, irc);
+	strcpy(Run.fDataName, DATA_DIR);
+	snprintf(&Run.fDataName[strlen(DATA_DIR)], MAXSTR - strlen(DATA_DIR), Config.AutoName, irc);
 	Run.fData = fopen(Run.fDataName, "ab");	// we append to data files
 	if (!Run.fData) {
 		Log(TXT_ERROR "DSINK: Can not open data file to write: %s (%m)\n", Run.fDataName);
@@ -978,7 +1030,7 @@ void SwitchAutoFile(void)
 	memset(Run.RecStat, 0, sizeof(Run.RecStat));
 	Run.LastFileStarted = time(NULL);
 	Run.FileCounter = 0;
-	SetInhibit(0);
+//	SetInhibit(0);
 }
 
 /*	Write and Send data from run.wData. Header MUST correspond to Run.fHead	*/
@@ -1129,9 +1181,7 @@ static void ProcessCmd(char *cmd)
 /*	The main								*/
 int main(int argc, char **argv)
 {
-	fd_set set;
-	struct timeval tm;
-	int i, irc;
+	int i;
 	
 	memset(&Run, 0, sizeof(Run));
 	read_history(".dsink_history");
@@ -1152,43 +1202,7 @@ int main(int argc, char **argv)
 
 //		Event loop
 	while (!Run.iStop) {
-
-		tm.tv_sec = 2;		// 2 s
-		tm.tv_usec = 0;
-		FD_ZERO(&set);
-		FD_SET(fileno(rl_instream), &set);
-		FD_SET(Run.fdPort, &set);
-		for (i=0; i<Run.NCon; i++) FD_SET(Run.Con[i].fd, &set);
-		for (i=0; i<Config.NSlaves; i++) if (Run.Slave[i].PID) FD_SET(Run.Slave[i].out.fd[0], &set);
-		for (i=0; i<Config.NSlaves; i++) if (Run.Slave[i].PID) FD_SET(Run.Slave[i].err.fd[0], &set);
-
-		irc = select(FD_SETSIZE, &set, NULL, NULL, &tm);
-		if (irc < 0) continue;
-
-		for (i=0; i<Config.NSlaves; i++) if (Run.Slave[i].PID && waitpid(Run.Slave[i].PID, NULL, WNOHANG)) {
-			Log(TXT_ERROR "DSINK: no/lost connection to %s\n", Config.SlaveList[i]);
-			Run.Slave[i].PID = 0;
-		}
-
-		if (irc) {
-			if (FD_ISSET(fileno(rl_instream), &set)) rl_callback_read_char();
-			if (FD_ISSET(Run.fdPort, &set)) {
-				if (Run.NCon < MAXCON) {
-					OpenCon(Run.fdPort, &Run.Con[Run.NCon]);
-					if (Run.Con[Run.NCon].fd > 0) Run.NCon++;
-				} else {
-					DropCon(Run.fdPort);
-				}
-			}
-			for (i=0; i<Run.NCon; i++) if (FD_ISSET(Run.Con[i].fd, &set)) GetAndWrite(i);
-			for (i=0; i<Config.NSlaves; i++) if (Run.Slave[i].PID && FD_ISSET(Run.Slave[i].out.fd[0], &set)) 
-				GetFromSlave(Config.SlaveList[i], &Run.Slave[i].out, &Run.Slave[i]);
-			for (i=0; i<Config.NSlaves; i++) if (Run.Slave[i].PID && FD_ISSET(Run.Slave[i].err.fd[0], &set)) 
-				GetFromSlave(Config.SlaveList[i], &Run.Slave[i].err, &Run.Slave[i]);
-			CleanCon();
-		} else {
-			FlushEvents(-1);
-		}
+		DoSelect(1);
 		if (Run.iAuto && Run.fData && time(NULL) > Run.LastFileStarted + Config.AutoTime) SwitchAutoFile();
 	}
 MyExit:
@@ -1207,7 +1221,7 @@ MyExit:
 		free(Run.Evt);
 	}
 	if (Run.EvtCopy) free(Run.EvtCopy);
-	if (Run.fData) fclose(Run.fData);
+	CloseDataFile();
 	if (Run.wData) free(Run.wData);
 	if (Run.fdUDP) close(Run.fdUDP);
 	sleep(2);
@@ -1215,7 +1229,7 @@ MyExit:
 		fclose(Run.fLog);
 		kill(Run.fLogPID, SIGINT);
 	}
-	rl_callback_handler_remove ();
+	rl_callback_handler_remove();
 	write_history(".dsink_history");	
 	return 0;
 }

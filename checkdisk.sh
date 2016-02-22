@@ -79,6 +79,7 @@ declare -a LIST
 
 LIST=(`ls $MOUNT_BASE | sort -n`)
 for ((n=0; $n<${#LIST[@]}; n=$n+1)); do
+	[ "$(mount | grep $MOUNT_BASE"/"${LIST[n]})"X == "X" ] && continue
 	TARGET="$MOUNT_BASE"/"${LIST[n]}"/data
 	[ ${LIST[n]} -le $NUM ] && continue
 	[ $(get_free $TARGET) -lt $MIN_SPACE ] && continue

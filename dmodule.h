@@ -17,6 +17,7 @@ private:
 	int wptr;		// write pointer, bytes
 	char ChanParity[64];	// WFD Channel block last parity: 0/1/-1(undefined)
 	char SumParity[4];	// TRIGGER sum block last parity: 0/1/-1(undefined)
+	int DelimParity;	// Delimiter block parity
 	int TrigToken;		// Trigger source last token
 	int DelimToken;		// Delimiter last token
 	short int SelfToken[64];	// self trig token

@@ -22,7 +22,7 @@
 #define TXT_WARN	TXT_BOLDBLUE   " WARN  " TXT_NORMAL
 #define TXT_ERROR	TXT_BOLDYELLOW " ERROR " TXT_NORMAL
 #define TXT_FATAL	TXT_BOLDRED    " FATAL " TXT_NORMAL
-#define DATA_DIR	"data"
+#define DATA_DIR	"data/"
 #define DATA_LOG	"datalog.txt"
 
 /*				Types and declarations		*/
@@ -61,9 +61,13 @@ struct event_struct {
 
 void Add2Event(int num, struct blkinfo_struct *info);
 void CheckReadyEvents(void);
+void DropCon(int fd);
 void FlushEvents(int lToken);
+void GetAndWrite(int num);
+void GetFromSlave(char *name, struct pipe_struct *p, struct slave_struct *slave);
 void Log(const char *msg, ...) __attribute__ ((format (printf, 1, 2)));
 char *My_inet_ntoa(int num);
+void OpenCon(int fd, con_struct *con);
 void ProcessData(char *buf);
 void SendFromFifo(struct slave_struct *slave);
 void SendScript(struct slave_struct *slave, const char *script);
