@@ -437,7 +437,10 @@ int GetNextAutoNumber(void)
 /*	Print Help								*/
 void Help(void)
 {
-	printf("Usage: dsink\n");
+	printf("Usage: dsink [-a] [-c config.conf] [-h]. Options:\n");
+	printf("-a - auto start data taking;\n");
+	printf("-c config.conf - use configuration file config,conf;\n");
+	printf("-h - print this message and exit.\n");
 	printf("Commands:\n");
 	printf("\tcmd <vme>|* <uwfdtool command> - send command to vme crate;\n");
 	printf("\tfile [<file_name>] - set file to write data;\n");
@@ -449,13 +452,10 @@ void Help(void)
 	printf("\tquit - Quit;\n");
 	printf("\tresume - clear inhibit;\n");
 	printf("\tstart/stop - start/stop data taking;\n");
-	printf("To write data file example.dat:\n");
-	printf("\tinit\n");
-	printf("\tfile example.dat\n");
+	printf("The simplest way to write data in automatic mode is:\n");
 	printf("\tstart\n");
-	printf("\t\t... DAQ started - wait for some data to be collected...\n");
-	printf("\tstop\n");
-	printf("You can omit init if you don't want system (re)initialization.\n");
+	printf("\tfile auto\n");
+	printf("\t\t... DAQ started - files and disks will be changed automatically\n");
 }
 
 void Info(void)
@@ -500,8 +500,25 @@ void Init(void)
 	char cmd[MAXSTR];
 	int i;
 
-	snprintf(cmd, MAXSTR, "p * %s;?;w 500;i *;?", Config.XilinxFirmware);
+	snprintf(cmd, MAXSTR, "p * %s;?", Config.XilinxFirmware);
 	for (i=0; i<Config.NSlaves; i++) if (Run.Slave[i].PID) SendScript(&Run.Slave[i], cmd);
+	for (i=0; i<Config.NSlaves; i++) while (Run.Slave[i].IsWaiting) DoSelect(0);
+	for (i=0; i<Config.NSlaves; i++) if (Run.Slave[i].LastResponse) break;
+	if (i != Config.NSlaves) {
+		Log(TXT_ERROR "DSINK: Can not load firmware - check VME responses.\n");
+		printf(TXT_BOLDRED "Init failed. Check the system and try again." TXT_NORMAL "\n");
+		return;
+	}
+	sleep(1);
+	for (i=0; i<Config.NSlaves; i++) if (Run.Slave[i].PID) SendScript(&Run.Slave[i], "i *;?");
+	for (i=0; i<Config.NSlaves; i++) while (Run.Slave[i].IsWaiting) DoSelect(0);
+	for (i=0; i<Config.NSlaves; i++) if (Run.Slave[i].LastResponse) break;
+	if (i != Config.NSlaves) {
+		Log(TXT_ERROR "DSINK: Can not initialize the modules - check VME responses.\n");
+		printf(TXT_BOLDRED "Init failed. Check the system and try again." TXT_NORMAL "\n");
+		return;
+	}
+
 	Run.Initialized = 1;
 }
 
@@ -559,7 +576,7 @@ void OpenCon(int fd, con_struct *con)
 }
 
 /*	Open file to write data							*/
-void OpenDataFile(char *name)
+void OpenDataFile(const char *name)
 {
 	char cmd[2*MAXSTR];
 	int irc;
@@ -747,7 +764,7 @@ void ProcessData(char *buf)
 }
 
 /*	Read configuration file							*/
-int ReadConf(char *fname)
+int ReadConf(const char *fname)
 {
 	config_t cnf;
 	int tmp;
@@ -955,24 +972,28 @@ void StartRun(void)
 	for (i=0; i<Config.NSlaves; i++) if (!Run.Slave[i].PID) break;
 	if (i != Config.NSlaves) {
 		Log(TXT_ERROR "DSINK: Not all VME crates are attached. Can not start.\n");
+		printf(TXT_BOLDRED "Start failed. Check the system and try again." TXT_NORMAL "\n");
 		return;	
 	}
 
-	Log(TXT_INFO "DSINK: Executing START command.\n");
+	if (!Run.Initialized) Init();
+	if (!Run.Initialized) return;
+
 	SetInhibit(1);
 	snprintf(str, MAXSTR, "y * * %s:%d;?", Config.MyName, Config.Port);
 	for (i=0; i<Config.NSlaves; i++) SendScript(&Run.Slave[i], str);
-/*	for (i=0; i<Config.NSlaves; i++) while (Run.Slave[i].IsWaiting);
+	for (i=0; i<Config.NSlaves; i++) while (Run.Slave[i].IsWaiting) DoSelect(0);
 	for (i=0; i<Config.NSlaves; i++) if (Run.Slave[i].LastResponse) break;
 	if (i != Config.NSlaves) {
 		Log(TXT_ERROR "DSINK: Can not start the run - check VME responses.\n");
+		printf(TXT_BOLDRED "Start failed. Check the system and try again." TXT_NORMAL "\n");
 		return;
 	}
-*/
 	sleep(1);
 	snprintf(str, MAXSTR, "z %d", Config.TriggerMasterModule);
 	SendScript(&Run.Slave[Config.TriggerMasterCrate], str);
 	SetInhibit(0);
+	Log(TXT_INFO "DSINK: Executing START command.\n");
 	for (i=0; i<MAXWFD; i++) if (Run.WFD[i]) {
 		Run.WFD[i]->ClearParity();
 		Run.WFD[i]->ClearCounters();
@@ -1181,12 +1202,34 @@ static void ProcessCmd(char *cmd)
 /*	The main								*/
 int main(int argc, char **argv)
 {
-	int i;
+	int i, c;
+	const char *ini_file_name;
+	int iAutoStart;
+
+//		Read options
+	iAutoStart = 0;
+	ini_file_name = (const char *) DEFCONFIG;
+	for (;;) {
+		c = getopt(argc, argv, "ac:h");
+		if (c == -1) break;
+		switch (c) {
+		case 'a':
+			iAutoStart = 1;
+			break;
+		case 'c':
+			ini_file_name = optarg;
+			break;
+		case 'h':
+		default:
+			Help();
+			return 0;
+		}
+	}
 	
 	memset(&Run, 0, sizeof(Run));
 	read_history(".dsink_history");
 
-	if (ReadConf((char *)DEFCONFIG)) goto MyExit;
+	if (ReadConf(ini_file_name)) goto MyExit;
 	if (OpenLog()) goto MyExit;
 	OpenUDP();
 
@@ -1198,7 +1241,10 @@ int main(int argc, char **argv)
 	if (OpenSlaves()) goto MyExit;
 
 	rl_callback_handler_install("DSINK > ", ProcessCmd);	
-
+	if (iAutoStart) {
+		Init();
+		OpenDataFile("auto");
+	}
 
 //		Event loop
 	while (!Run.iStop) {
