@@ -1242,7 +1242,7 @@ int main(int argc, char **argv)
 
 	rl_callback_handler_install("DSINK > ", ProcessCmd);	
 	if (iAutoStart) {
-		Init();
+		StartRun();
 		OpenDataFile("auto");
 	}
 
