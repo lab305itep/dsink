@@ -72,6 +72,8 @@ void ProcessData(char *buf);
 void SendFromFifo(struct slave_struct *slave);
 void SendScript(struct slave_struct *slave, const char *script);
 pid_t StartProcess(char *cmd);
+void StartRun(void);
+void StopRun(void);
 void WriteEvent(int lToken, struct event_struct *event);
 void WriteSelfTrig(int num, struct blkinfo_struct *info);
 

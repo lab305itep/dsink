@@ -78,6 +78,7 @@ struct run_struct {
 	int RecStat[2];			// events/selftriggers in the output file
 	int LastFileStarted;		// time() when the last file was started
 	long long FileCounter;		// bytes to the last file
+	int RestartFlag;		// flag restart
 } Run;
 
 /*				Functions			*/
@@ -98,6 +99,7 @@ void Add2Event(int num, struct blkinfo_struct *info)
 	if (k >= Config.MaxEvent) {
 		Log(TXT_ERROR "DSINK: Event cache of %d events looks too small: long token = %d token base = %d Module %d.\n", 
 			Config.MaxEvent, info->lToken, Run.lTokenBase, num);
+		Run.RestartFlag = 1;
 		return;
 	}
 	// Check memory
@@ -105,7 +107,8 @@ void Add2Event(int num, struct blkinfo_struct *info)
 	if (new_len + Run.Evt[k].len > Run.Evt[k].size) {
 		ptr = (char *)realloc(Run.Evt[k].data, Run.Evt[k].size + MCHUNK);
 		if (!ptr) {
-			Log(TXT_ERROR "DSINK: Out of memory: %m\n");
+			Log(TXT_FATAL "DSINK: Out of memory: %m\n");
+			Run.iStop = 1;
 			return;
 		}
 		Run.Evt[k].data = ptr;
@@ -897,6 +900,24 @@ int ReadConf(const char *fname)
 	return 0;
 }
 
+/*	Restart data taking on a signoificant error				*/
+void RestartRun(void)
+{
+	Log(TXT_INFO "DSINK: Restatring.");
+	StopRun();
+	if (Run.iAuto) {
+		Init();
+		if (Run.Initialized) {
+			OpenDataFile("auto");
+			StartRun();
+		} else {
+			Run.iAuto = 0;
+		}
+	}
+	Run.RestartFlag = 0;
+}
+
+/*	Send script from FIFO to the slave					*/
 void SendFromFifo(struct slave_struct *slave)
 {
 	char *ptr;
@@ -920,7 +941,7 @@ void SendFromFifo(struct slave_struct *slave)
 	fflush(slave->in.f);
 }
 
-/*	Send a script divided by semicolons as separate lines to f		*/
+/*	Send a script divided by semicolons as separate lines to FIFO		*/
 void SendScript(struct slave_struct *slave, const char *script)
 {
 	if (strlen(script) + strlen(slave->CommandFifo) > MAXSTR) {
@@ -1249,6 +1270,7 @@ int main(int argc, char **argv)
 //		Event loop
 	while (!Run.iStop) {
 		DoSelect(1);
+		if (Run.RestartFlag) RestartRun();
 		if (Run.iAuto && Run.fData && time(NULL) > Run.LastFileStarted + Config.AutoTime) SwitchAutoFile();
 	}
 MyExit:
