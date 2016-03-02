@@ -35,6 +35,7 @@ public:
 	void ClearCounters(void);
 	void ClearParity(void);
 	int GetLongDelim(void);
+	void Reset(void);
 };
 
 //	Indexes in ErrCnt

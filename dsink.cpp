@@ -503,6 +503,7 @@ void Init(void)
 	char cmd[MAXSTR];
 	int i;
 
+	Run.Initialized = 0;
 	snprintf(cmd, MAXSTR, "p * %s;?", Config.XilinxFirmware);
 	for (i=0; i<Config.NSlaves; i++) if (Run.Slave[i].PID) SendScript(&Run.Slave[i], cmd);
 	for (i=0; i<Config.NSlaves; i++) while (Run.Slave[i].IsWaiting) DoSelect(0);
@@ -739,6 +740,7 @@ void ProcessData(char *buf)
 	struct blkinfo_struct *info;
 	int num;
 	
+	if (Run.RestartFlag) return;
 	header = (struct rec_header_struct *)buf;
 	if ((header->type & 0xFFFF0000) != REC_WFDDATA) return;	// we ignore other records here
 	num = header->type & REC_SERIALMASK;
@@ -903,7 +905,7 @@ int ReadConf(const char *fname)
 /*	Restart data taking on a signoificant error				*/
 void RestartRun(void)
 {
-	Log(TXT_INFO "DSINK: Restatring.");
+	Log(TXT_INFO "DSINK: Restarting.\n");
 	StopRun();
 	if (Run.iAuto) {
 		Init();
@@ -1001,6 +1003,9 @@ void StartRun(void)
 	if (!Run.Initialized) return;
 
 	SetInhibit(1);
+
+	for(i=0; i<MAXWFD; i++) if (Run.WFD[i]) Run.WFD[i]->Reset();
+
 	snprintf(str, MAXSTR, "y * * %s:%d;?", Config.MyName, Config.Port);
 	for (i=0; i<Config.NSlaves; i++) SendScript(&Run.Slave[i], str);
 	for (i=0; i<Config.NSlaves; i++) while (Run.Slave[i].IsWaiting) DoSelect(0);

@@ -17,10 +17,7 @@ Dmodule::Dmodule(int num)
 		Log(TXT_FATAL "DSINK: Memory allocation failure for module %d\n", Serial);
 		throw -10;
 	}
-	rptr = 0;
-	wptr = 0;
-	ClearCounters();
-	ClearParity();
+	Reset();
 }
 
 Dmodule::~Dmodule(void)
@@ -215,5 +212,13 @@ void Dmodule::ClearParity(void)
 	DelimToken = -1;
 	DelimParity = -1;
 	memset(SelfToken, -1, sizeof(SelfToken));
+}
+
+void Dmodule::Reset(void)
+{
+	rptr = 0;
+	wptr = 0;
+	ClearCounters();
+	ClearParity();
 }
 
