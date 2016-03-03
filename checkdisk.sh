@@ -68,7 +68,7 @@ fi
 
 declare -i NUM
 
-if [ -d $DATA_DIR ] ; then
+if [ -h $DATA_DIR ] ; then
     NUM=`get_data_num $DATA_DIR`
     unlink $DATA_DIR
 else
