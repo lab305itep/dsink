@@ -33,7 +33,7 @@ get_free ()
 # For wrong label format -1 is returned.
 get_data_num ()
 {
-    local tmp=`df $1 | grep /dev/`
+    local tmp=`df $1 2> /dev/null | grep /dev/`
     tmp=`get_word 1 $tmp`
     if [ "$tmp"X == "X" ] ; then 
 	echo "-1"

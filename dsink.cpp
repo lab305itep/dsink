@@ -36,6 +36,8 @@ struct cfg_struct {
 	char SlaveCMD[MAXSTR];		// Command to start slave
 	int TriggerMasterCrate;		// Trigger master crate (index in slave list)
 	int TriggerMasterModule;	// Trigger master module
+	int VetoMasterCrate;		// Veto master crate (index in slave list)
+	int VetoMasterModule;		// Veto master module
 	char LogFile[MAXSTR];		// dsink log file name
 	char LogTermCMD[MAXSTR];	// start log view in a separate window
 	char XilinxFirmware[MAXSTR];	// Xilinx firmware
@@ -522,6 +524,9 @@ void Init(void)
 		printf(TXT_BOLDRED "Init failed. Check the system and try again." TXT_NORMAL "\n");
 		return;
 	}
+//		Clear inhibit on VETO module
+	snprintf(cmd, MAXSTR, "m %d 0;?", Config.VetoMasterModule);	
+	SendScript(&Run.Slave[Config.VetoMasterCrate], cmd);
 
 	Run.Initialized = 1;
 }
@@ -822,6 +827,17 @@ int ReadConf(const char *fname)
 	}
 	tok = strtok(NULL, " \t,:");
 	Config.TriggerMasterModule = (tok) ? strtol(tok, NULL, 0) : 1;
+//	char VetoMaster[MAXSTR];	// Trigger master module and crate (index in slave list)
+	if (!config_lookup_string(&cnf, "Sink.VetoMaster", (const char **) &stmp)) stmp = (char *)"0:1";
+	tok = strtok(stmp, " \t,:");
+	Config.VetoMasterCrate = strtol(tok, NULL, 0);
+	if (Config.VetoMasterCrate < 0 || Config.VetoMasterCrate >= Config.NSlaves) {
+		Log(TXT_FATAL "DSINK: Config.VetoMasterCrate = %d out of range in file %s\n", Config.VetoMasterCrate, fname);
+		config_destroy(&cnf);
+		return -12;
+	}
+	tok = strtok(NULL, " \t,:");
+	Config.VetoMasterModule = (tok) ? strtol(tok, NULL, 0) : 1;
 //	char LogFile[MAXSTR];		// dsink log file name
 	strncpy(Config.LogFile, (config_lookup_string(&cnf, "Sink.LogFile", (const char **) &stmp)) ? stmp : "dsink.log", MAXSTR);
 //	char LogTermCMD[MAXSTR];	// start log view in a separate window
