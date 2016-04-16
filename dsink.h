@@ -9,6 +9,7 @@
 #define MAXWFD	70
 #define MAXSTR	1024
 #define MBYTE	0x100000
+#define CLIENTBSIZE	(256 * MBYTE)
 #define MCHUNK	0x10000
 #define DEFCONFIG	"general.conf"
 #define SSH	"/usr/bin/ssh"
@@ -36,6 +37,13 @@ struct con_struct {
 	int ErrCnt;
 	struct rec_header_struct *header;
 };
+
+struct client_struct {
+	int fd;
+	int ip;
+	FILE *f;
+};
+
 struct pipe_struct {
 	int fd[2];
 	FILE* f;
@@ -67,6 +75,7 @@ void GetAndWrite(int num);
 void GetFromSlave(char *name, struct pipe_struct *p, struct slave_struct *slave);
 void Log(const char *msg, ...) __attribute__ ((format (printf, 1, 2)));
 char *My_inet_ntoa(int num);
+int OpenClient(void);
 void OpenCon(int fd, con_struct *con);
 void ProcessData(char *buf);
 void SendFromFifo(struct slave_struct *slave);

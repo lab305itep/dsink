@@ -27,10 +27,9 @@
 
 /*				Global variables		*/
 struct cfg_struct {
-	int Port;			// Data port 0xA336
+	int InPort;			// Data port 0xA336
+	int OutPort;			// Out port  0xB230
 	char MyName[MAXSTR];		// The server host name
-	int UDPPort;			// UDP port  0xA230
-	char UDPHost[MAXSTR];		// Host to send UDP data
 	char SlaveList[MAXCON][MAXSTR];	// Crate host names list
 	int NSlaves;			// number of crates
 	char SlaveCMD[MAXSTR];		// Command to start slave
@@ -61,13 +60,14 @@ struct run_struct {
 	FILE *fData;			// Data file
 	char fDataName[MAXSTR];		// Data file name
 	struct rec_header_struct fHead;	// record header to write data file
-	int fdUDP;			// udp socket to send data for analysis
 	void *wData;			// mememory for write data
 	int wDataSize;			// size of wData 
 	int fdPort;			// Port for input data connections
 	struct slave_struct Slave[MAXCON];	// Slave VME connections
 	con_struct Con[MAXCON];		// Data connections
 	int NCon;			// Number of data connections
+	int fdOut;			// port for output data connections
+	struct client_struct Client[MAXCON];	// output data clients
 	int iStop;			// Quit flag
 	int iRun;			// DAQ running flag
 	int iAuto;			// Auto change file mode
@@ -125,7 +125,7 @@ void Add2Event(int num, struct blkinfo_struct *info)
 }
 
 /*	Initialize data connection port				*/
-int BindPort(void)
+int BindPort(int port)
 {
 	int fd;
 	struct sockaddr_in name;
@@ -136,16 +136,16 @@ int BindPort(void)
 		return fd;
 	}
 	name.sin_family = AF_INET;
-	name.sin_port = htons(Config.Port);
+	name.sin_port = htons(port);
 	name.sin_addr.s_addr = htonl(INADDR_ANY);
 	if (bind(fd, (struct sockaddr *)&name, sizeof(name)) < 0) {
-		printf(TXT_FATAL "DSINK: Can not bind to port %d: %m\n", Config.Port);
+		printf(TXT_FATAL "DSINK: Can not bind to port %d: %m\n", port);
 		close(fd);
 		return -1;
 	}
 	
 	if (listen(fd, MAXCON) < 0) {
-		printf(TXT_FATAL "DSINK: Can not listen to port %d: %m\n", Config.Port);
+		printf(TXT_FATAL "DSINK: Can not listen to port %d: %m\n", port);
 		close(fd);
 		return -1;
 	}
@@ -218,6 +218,7 @@ void DoSelect(int AcceptCommands)
 	FD_ZERO(&set);
 	if (AcceptCommands) FD_SET(fileno(rl_instream), &set);
 	FD_SET(Run.fdPort, &set);
+	FD_SET(Run.fdOut, &set);
 	for (i=0; i<Run.NCon; i++) FD_SET(Run.Con[i].fd, &set);
 	for (i=0; i<Config.NSlaves; i++) if (Run.Slave[i].PID) FD_SET(Run.Slave[i].out.fd[0], &set);
 	for (i=0; i<Config.NSlaves; i++) if (Run.Slave[i].PID) FD_SET(Run.Slave[i].err.fd[0], &set);
@@ -240,6 +241,7 @@ void DoSelect(int AcceptCommands)
 				DropCon(Run.fdPort);
 			}
 		}
+		if (FD_ISSET(Run.fdOut, &set) && OpenClient()) DropCon(Run.fdOut);
 		for (i=0; i<Run.NCon; i++) if (FD_ISSET(Run.Con[i].fd, &set)) GetAndWrite(i);
 		for (i=0; i<Config.NSlaves; i++) if (Run.Slave[i].PID && FD_ISSET(Run.Slave[i].out.fd[0], &set)) 
 			GetFromSlave(Config.SlaveList[i], &Run.Slave[i].out, &Run.Slave[i]);
@@ -557,7 +559,42 @@ char *My_inet_ntoa(int num)
 	return inet_ntoa(addr);
 }
 
-/*	Open client data connection to the server				*/
+/*	Open client data connection to the server. Return 0 on success.		*/
+int OpenClient(void)
+{
+	struct sockaddr_in addr;
+	socklen_t len;
+	int i, irc;
+
+	// Search for empty slot
+	for (i=0; i<MAXCON; i++) if (!Run.Client[i].f) break;
+	if (i == MAXCON) return 100;
+	
+	len = sizeof(addr);
+	irc = accept(Run.fdOut, (struct sockaddr *)&addr, &len);
+	if (irc < 0) {
+		Log(TXT_ERROR "DSINK: Client connection accept error: %m\n");
+		return -10;
+	}
+	Run.Client[i].fd = irc;
+	Run.Client[i].ip = addr.sin_addr.s_addr;
+	Run.Client[i].f = fdopen(irc, "wb");
+	if (!Run.Client[i].f) {
+		Log(TXT_ERROR "DSINK: Client fdopen error: %m\n");
+		return -20;
+	}
+	irc = setvbuf(Run.Client[i].f, NULL, _IOFBF, CLIENTBSIZE);
+	if (!irc) {
+		Log(TXT_ERROR "DSINK: Client setvbuf error: %m\n");
+		fclose(Run.Client[i].f);
+		Run.Client[i].f = NULL;
+		return -30;
+	}
+	Log(TXT_INFO "DSINK: client connection from %s accepted\n", inet_ntoa(addr.sin_addr));
+	return 0;
+}
+
+/*	Open slave data connection to the server				*/
 void OpenCon(int fd, con_struct *con)
 {
 	struct sockaddr_in addr;
@@ -581,7 +618,7 @@ void OpenCon(int fd, con_struct *con)
 	con->fd = irc;
 	con->ip = addr.sin_addr.s_addr;
 	con->BlkCnt = -1;
-	Log(TXT_INFO "DSINK: connection from %s accepted\n", inet_ntoa(addr.sin_addr));
+	Log(TXT_INFO "DSINK: data connection from %s accepted\n", inet_ntoa(addr.sin_addr));
 }
 
 /*	Open file to write data							*/
@@ -707,37 +744,6 @@ int OpenSlaves(void)
 	return 0;
 }
 
-/*	Create socket for UDP write						*/
-void OpenUDP(void)
-{
-	struct hostent *host;
-	struct sockaddr_in hostname;
-
-	Run.fdUDP = -1;
-	host = gethostbyname(Config.UDPHost);
-	if (!host) {
-		Log(TXT_ERROR "DSINK: Host %s not found (UDP server).\n", Config.UDPHost);
-		return;
-	}
-
-	hostname.sin_family = AF_INET;
-	hostname.sin_port = htons(Config.UDPPort);
-	hostname.sin_addr = *(struct in_addr *) host->h_addr;
-
-	Run.fdUDP = socket(PF_INET, SOCK_DGRAM, 0);
-	if (Run.fdUDP < 0) {
-		Log(TXT_ERROR "DSINK: Can not create socket %s:%d - %m\n", Config.UDPHost, Config.UDPPort);
-		return;
-	}
-
-	if (connect(Run.fdUDP, (struct sockaddr *)&hostname, sizeof(hostname))) {
-		Log(TXT_ERROR "Setting default UDP destination to %s:%d failed %m\n", Config.UDPHost, Config.UDPPort);
-		close(Run.fdUDP);
-		Run.fdUDP = -1;
-		return;
-	}
-}
-
 /*	Process data received							*/
 void ProcessData(char *buf)
 {
@@ -791,14 +797,12 @@ int ReadConf(const char *fname)
 		config_destroy(&cnf);
             	return -10;
     	}
-//	int Port;			// Data port 0xA336
-	Config.Port = (config_lookup_int(&cnf, "Sink.Port", &tmp)) ? tmp : 0xA336;
-//	int UDPPort;			// UDP port 0xA230
-	Config.UDPPort = (config_lookup_int(&cnf, "Sink.UDPPort", &tmp)) ? tmp : 0xA230;
+//	int InPort;			// Data port 0xA336
+	Config.InPort = (config_lookup_int(&cnf, "Sink.InPort", &tmp)) ? tmp : 0xA336;
+//	int OutPort;			// Out port 0xB230
+	Config.OutPort = (config_lookup_int(&cnf, "Sink.OutPort", &tmp)) ? tmp : 0xB230;
 //	char MyName[MAXSTR];		// The server host name
 	strncpy(Config.MyName, (config_lookup_string(&cnf, "Sink.MyName", (const char **) &stmp)) ? stmp : "dserver.danss.local", MAXSTR);
-//	char UDPHost[MAXSTR];		// host to send UDP data
-	strncpy(Config.UDPHost, (config_lookup_string(&cnf, "Sink.UDPHost", (const char **) &stmp)) ? stmp : "dserver.danss.local", MAXSTR);
 //	char SlaveList[MAXCON][MAXSTR];	// Crate host names list
 	if (!config_lookup_string(&cnf, "Sink.SlaveList", (const char **) &stmp)) 
 		stmp = (char *)"vme01.danss.local vme02.danss.local vme03.danss.local vme04.danss.local";
@@ -1022,7 +1026,7 @@ void StartRun(void)
 
 	for(i=0; i<MAXWFD; i++) if (Run.WFD[i]) Run.WFD[i]->Reset();
 
-	snprintf(str, MAXSTR, "y * * %s:%d;?", Config.MyName, Config.Port);
+	snprintf(str, MAXSTR, "y * * %s:%d;?", Config.MyName, Config.InPort);
 	for (i=0; i<Config.NSlaves; i++) SendScript(&Run.Slave[i], str);
 	for (i=0; i<Config.NSlaves; i++) while (Run.Slave[i].IsWaiting) DoSelect(0);
 	for (i=0; i<Config.NSlaves; i++) if (Run.Slave[i].LastResponse) break;
@@ -1100,6 +1104,7 @@ void SwitchAutoFile(void)
 void WriteAndSend(void)
 {
 	int irc;
+	int i;
 
 	if (Run.fData) {
 		irc = fwrite(Run.wData, Run.fHead.len, 1, Run.fData);
@@ -1111,7 +1116,14 @@ void WriteAndSend(void)
 		Run.FileCounter += Run.fHead.len;
 		if (Run.iAuto && Run.FileCounter > (long long) Config.AutoSize * MBYTE) SwitchAutoFile();
 	}
-	if (Run.fdUDP >= 0) TEMP_FAILURE_RETRY(write(Run.fdUDP, Run.wData, Run.fHead.len));
+	for (i=0; i<MAXCON; i++) if (Run.Client[i].f) {
+		irc = fwrite(Run.wData, Run.fHead.len, 1, Run.Client[i].f);
+		if (irc != 1) {
+			Log(TXT_WARN "DSINK: Client write failure %m\n");
+			fclose(Run.Client[i].f);
+			Run.Client[i].f = NULL;
+		}
+	}
 	Run.fHead.cnt++;
 }
 
@@ -1273,12 +1285,14 @@ int main(int argc, char **argv)
 
 	if (ReadConf(ini_file_name)) goto MyExit;
 	if (OpenLog()) goto MyExit;
-	OpenUDP();
 
 	Log(TXT_INFO "DSINK started.\n");
 
-	Run.fdPort = BindPort();
+	Run.fdPort = BindPort(Config.InPort);
 	if (Run.fdPort < 0) goto MyExit;	
+
+	Run.fdOut = BindPort(Config.OutPort);
+	if (Run.fdOut < 0) goto MyExit;	
 
 	if (OpenSlaves()) goto MyExit;
 
@@ -1312,7 +1326,8 @@ MyExit:
 	if (Run.EvtCopy) free(Run.EvtCopy);
 	CloseDataFile();
 	if (Run.wData) free(Run.wData);
-	if (Run.fdUDP) close(Run.fdUDP);
+	if (Run.fdOut)	close(Run.fdOut);
+	for (i=0; i<MAXCON; i++) if (Run.Client[i].f) fclose(Run.Client[i].f);
 	sleep(2);
 	if (Run.fLog) {
 		fclose(Run.fLog);
