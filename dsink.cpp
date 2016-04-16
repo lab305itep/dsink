@@ -6,6 +6,7 @@
 #include <arpa/inet.h>
 #include <ctype.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <libconfig.h>
 #include <netdb.h>
 #include <netinet/in.h>
@@ -127,7 +128,7 @@ void Add2Event(int num, struct blkinfo_struct *info)
 /*	Initialize data connection port				*/
 int BindPort(int port)
 {
-	int fd;
+	int fd, i, irc;
 	struct sockaddr_in name;
 	
 	fd = socket (PF_INET, SOCK_STREAM, 0);
@@ -135,6 +136,15 @@ int BindPort(int port)
 		printf(TXT_FATAL "DSINK: Can not create socket.: %m\n");
 		return fd;
 	}
+
+	i = 1;
+	irc = setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &i, sizeof(i));
+	if (irc) {
+		Log(TXT_ERROR "DSINK: setsockopt error: %m\n");
+		close(fd);
+		return -1;
+	}
+
 	name.sin_family = AF_INET;
 	name.sin_port = htons(port);
 	name.sin_addr.s_addr = htonl(INADDR_ANY);
@@ -565,6 +575,7 @@ int OpenClient(void)
 	struct sockaddr_in addr;
 	socklen_t len;
 	int i, irc;
+	int flags;
 
 	// Search for empty slot
 	for (i=0; i<MAXCON; i++) if (!Run.Client[i].f) break;
@@ -578,15 +589,33 @@ int OpenClient(void)
 	}
 	Run.Client[i].fd = irc;
 	Run.Client[i].ip = addr.sin_addr.s_addr;
-	Run.Client[i].f = fdopen(irc, "wb");
+
+        flags = fcntl (Run.Client[i].fd, F_GETFL, 0);
+	if (flags == -1) {
+		Log(TXT_ERROR "DSINK: Client fcntl get error: %m\n");
+		close(Run.Client[i].fd);
+		return -12;
+	}
+        flags |= O_NONBLOCK;
+        irc = fcntl(Run.Client[i].fd, F_SETFL, flags);
+	if (irc == -1) {
+		Log(TXT_ERROR "DSINK: Client fcntl set error: %m\n");
+		close(Run.Client[i].fd);
+		return -15;
+
+	}
+
+	Run.Client[i].f = fdopen(Run.Client[i].fd, "wb");
 	if (!Run.Client[i].f) {
 		Log(TXT_ERROR "DSINK: Client fdopen error: %m\n");
+		close(Run.Client[i].fd);
 		return -20;
 	}
 	irc = setvbuf(Run.Client[i].f, NULL, _IOFBF, CLIENTBSIZE);
-	if (!irc) {
+	if (irc) {
 		Log(TXT_ERROR "DSINK: Client setvbuf error: %m\n");
 		fclose(Run.Client[i].f);
+		close(Run.Client[i].fd);
 		Run.Client[i].f = NULL;
 		return -30;
 	}
@@ -1121,6 +1150,7 @@ void WriteAndSend(void)
 		if (irc != 1) {
 			Log(TXT_WARN "DSINK: Client write failure %m\n");
 			fclose(Run.Client[i].f);
+			shutdown(Run.Client[i].fd, 2);
 			Run.Client[i].f = NULL;
 		}
 	}
@@ -1288,6 +1318,8 @@ int main(int argc, char **argv)
 
 	Log(TXT_INFO "DSINK started.\n");
 
+	signal(SIGPIPE, SIG_IGN);
+
 	Run.fdPort = BindPort(Config.InPort);
 	if (Run.fdPort < 0) goto MyExit;	
 
@@ -1327,12 +1359,16 @@ MyExit:
 	CloseDataFile();
 	if (Run.wData) free(Run.wData);
 	if (Run.fdOut)	close(Run.fdOut);
-	for (i=0; i<MAXCON; i++) if (Run.Client[i].f) fclose(Run.Client[i].f);
+	for (i=0; i<MAXCON; i++) if (Run.Client[i].f) {
+		fclose(Run.Client[i].f);
+		shutdown(Run.Client[i].fd, 2);
+	}
 	sleep(2);
 	if (Run.fLog) {
 		fclose(Run.fLog);
 		kill(Run.fLogPID, SIGINT);
 	}
+	signal(SIGPIPE, SIG_DFL);
 	rl_callback_handler_remove();
 	write_history(".dsink_history");	
 	return 0;
