@@ -149,13 +149,13 @@ int BindPort(int port)
 	name.sin_port = htons(port);
 	name.sin_addr.s_addr = htonl(INADDR_ANY);
 	if (bind(fd, (struct sockaddr *)&name, sizeof(name)) < 0) {
-		printf(TXT_FATAL "DSINK: Can not bind to port %d: %m\n", port);
+		Log(TXT_FATAL "DSINK: Can not bind to port %d: %m\n", port);
 		close(fd);
 		return -1;
 	}
 	
 	if (listen(fd, MAXCON) < 0) {
-		printf(TXT_FATAL "DSINK: Can not listen to port %d: %m\n", port);
+		Log(TXT_FATAL "DSINK: Can not listen to port %d: %m\n", port);
 		close(fd);
 		return -1;
 	}
@@ -181,6 +181,40 @@ void CleanCon(void)
 	for (j=0; j<Run.NCon; j++) if (Run.Con[j].fd < 0) {	
 		for (i=j; i<Run.NCon-1; i++) memcpy(&Run.Con[i], &Run.Con[i+1], sizeof(Run.Con[0]));
 		Run.NCon--;
+	}
+}
+
+/*	Push data for client to FIFO. Do nothing if no space left.	*/
+void ClientPush(struct client_struct *client, char *data, int len)
+{
+	int flen;
+
+	flen = client->rptr - client->wptr;
+	if (flen < 0) flen += FIFOSIZE;
+	if (flen <= len) return;	// no room left
+
+	flen = (len <= FIFOSIZE - client->wptr) ? len : FIFOSIZE - client->wptr;
+	memcpy(&client->fifo[client->wptr], data, flen);
+	if (flen < len) memcpy(client->fifo, &data[flen], len - flen);
+	client->wptr += len;
+	if (client->wptr > FIFOSIZE) client->wptr -= FIFOSIZE;
+}
+
+/*	Send data from fifo to TCP client			*/
+void ClientSend(struct client_struct *client)
+{
+	int flen, irc;
+	
+	flen = (client->wptr > client->rptr) ? client->wptr - client->rptr : FIFOSIZE > client->rptr;
+	irc = write(client->fd, &client->fifo[client->rptr], flen);
+	if (irc < 0) {
+		Log(TXT_WARN "DSINK: Client %s send error: %m\n", My_inet_ntoa(client->ip));
+		shutdown(client->fd, 2);
+		free(client->fifo);
+		client->fd = 0;
+	} else {
+		client->rptr += irc;
+		if (client->rptr == FIFOSIZE) client->rptr = 0;
 	}
 }
 
@@ -220,6 +254,7 @@ void CloseSlaves(void)
 void DoSelect(int AcceptCommands)
 {
 	fd_set set;
+	fd_set wset;
 	struct timeval tm;
 	int i, irc;
 	
@@ -233,7 +268,10 @@ void DoSelect(int AcceptCommands)
 	for (i=0; i<Config.NSlaves; i++) if (Run.Slave[i].PID) FD_SET(Run.Slave[i].out.fd[0], &set);
 	for (i=0; i<Config.NSlaves; i++) if (Run.Slave[i].PID) FD_SET(Run.Slave[i].err.fd[0], &set);
 
-	irc = select(FD_SETSIZE, &set, NULL, NULL, &tm);
+	FD_ZERO(&wset);
+	for (i=0; i<MAXCON; i++) if (Run.Client[i].fd && Run.Client[i].rptr != Run.Client[i].wptr) FD_SET(Run.Client[i].fd, &wset);
+
+	irc = select(FD_SETSIZE, &set, &wset, NULL, &tm);
 	if (irc < 0) return;
 
 	for (i=0; i<Config.NSlaves; i++) if (Run.Slave[i].PID && waitpid(Run.Slave[i].PID, NULL, WNOHANG)) {
@@ -251,13 +289,14 @@ void DoSelect(int AcceptCommands)
 				DropCon(Run.fdPort);
 			}
 		}
-		if (FD_ISSET(Run.fdOut, &set) && OpenClient()) DropCon(Run.fdOut);
+		if (FD_ISSET(Run.fdOut, &set) && OpenClient() > 0) DropCon(Run.fdOut);
 		for (i=0; i<Run.NCon; i++) if (FD_ISSET(Run.Con[i].fd, &set)) GetAndWrite(i);
 		for (i=0; i<Config.NSlaves; i++) if (Run.Slave[i].PID && FD_ISSET(Run.Slave[i].out.fd[0], &set)) 
 			GetFromSlave(Config.SlaveList[i], &Run.Slave[i].out, &Run.Slave[i]);
 		for (i=0; i<Config.NSlaves; i++) if (Run.Slave[i].PID && FD_ISSET(Run.Slave[i].err.fd[0], &set)) 
 			GetFromSlave(Config.SlaveList[i], &Run.Slave[i].err, &Run.Slave[i]);
-			CleanCon();
+		CleanCon();
+		for (i=0; i<MAXCON; i++) if (Run.Client[i].fd && FD_ISSET(Run.Client[i].fd, &wset)) ClientSend(&Run.Client[i]);
 	} else {
 		FlushEvents(-1);
 	}
@@ -575,50 +614,30 @@ int OpenClient(void)
 	struct sockaddr_in addr;
 	socklen_t len;
 	int i, irc;
-	int flags;
 
 	// Search for empty slot
-	for (i=0; i<MAXCON; i++) if (!Run.Client[i].f) break;
+	for (i=0; i<MAXCON; i++) if (!Run.Client[i].fd) break;
 	if (i == MAXCON) return 100;
 	
 	len = sizeof(addr);
 	irc = accept(Run.fdOut, (struct sockaddr *)&addr, &len);
-	if (irc < 0) {
+	if (irc <= 0) {
 		Log(TXT_ERROR "DSINK: Client connection accept error: %m\n");
 		return -10;
 	}
 	Run.Client[i].fd = irc;
 	Run.Client[i].ip = addr.sin_addr.s_addr;
+	Run.Client[i].rptr = 0;
+	Run.Client[i].wptr = 0;
 
-        flags = fcntl (Run.Client[i].fd, F_GETFL, 0);
-	if (flags == -1) {
-		Log(TXT_ERROR "DSINK: Client fcntl get error: %m\n");
+	Run.Client[i].fifo = (char *) malloc(FIFOSIZE);
+	if (!Run.Client[i].fifo) {
 		close(Run.Client[i].fd);
-		return -12;
-	}
-        flags |= O_NONBLOCK;
-        irc = fcntl(Run.Client[i].fd, F_SETFL, flags);
-	if (irc == -1) {
-		Log(TXT_ERROR "DSINK: Client fcntl set error: %m\n");
-		close(Run.Client[i].fd);
-		return -15;
-
-	}
-
-	Run.Client[i].f = fdopen(Run.Client[i].fd, "wb");
-	if (!Run.Client[i].f) {
-		Log(TXT_ERROR "DSINK: Client fdopen error: %m\n");
-		close(Run.Client[i].fd);
+		Run.Client[i].fd = 0;
+		Log(TXT_ERROR "DSINK: Client FIFO allocation error: %m\n");
 		return -20;
 	}
-	irc = setvbuf(Run.Client[i].f, NULL, _IOFBF, CLIENTBSIZE);
-	if (irc) {
-		Log(TXT_ERROR "DSINK: Client setvbuf error: %m\n");
-		fclose(Run.Client[i].f);
-		close(Run.Client[i].fd);
-		Run.Client[i].f = NULL;
-		return -30;
-	}
+
 	Log(TXT_INFO "DSINK: client connection from %s accepted\n", inet_ntoa(addr.sin_addr));
 	return 0;
 }
@@ -1145,15 +1164,7 @@ void WriteAndSend(void)
 		Run.FileCounter += Run.fHead.len;
 		if (Run.iAuto && Run.FileCounter > (long long) Config.AutoSize * MBYTE) SwitchAutoFile();
 	}
-	for (i=0; i<MAXCON; i++) if (Run.Client[i].f) {
-		irc = fwrite(Run.wData, Run.fHead.len, 1, Run.Client[i].f);
-		if (irc != 1) {
-			Log(TXT_WARN "DSINK: Client write failure %m\n");
-			fclose(Run.Client[i].f);
-			shutdown(Run.Client[i].fd, 2);
-			Run.Client[i].f = NULL;
-		}
-	}
+	for (i=0; i<MAXCON; i++) if (Run.Client[i].fd) ClientPush(&Run.Client[i], (char *)Run.wData, Run.fHead.len);
 	Run.fHead.cnt++;
 }
 
@@ -1359,9 +1370,9 @@ MyExit:
 	CloseDataFile();
 	if (Run.wData) free(Run.wData);
 	if (Run.fdOut)	close(Run.fdOut);
-	for (i=0; i<MAXCON; i++) if (Run.Client[i].f) {
-		fclose(Run.Client[i].f);
+	for (i=0; i<MAXCON; i++) if (Run.Client[i].fd) {
 		shutdown(Run.Client[i].fd, 2);
+		free(Run.Client[i].fifo);
 	}
 	sleep(2);
 	if (Run.fLog) {

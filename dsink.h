@@ -9,7 +9,7 @@
 #define MAXWFD	70
 #define MAXSTR	1024
 #define MBYTE	0x100000
-#define CLIENTBSIZE	(256 * MBYTE)
+#define FIFOSIZE	(16 * MBYTE)
 #define MCHUNK	0x10000
 #define DEFCONFIG	"general.conf"
 #define SSH	"/usr/bin/ssh"
@@ -41,7 +41,9 @@ struct con_struct {
 struct client_struct {
 	int fd;
 	int ip;
-	FILE *f;
+	char *fifo;
+	int wptr;
+	int rptr;
 };
 
 struct pipe_struct {
