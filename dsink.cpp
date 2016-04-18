@@ -190,7 +190,7 @@ void ClientPush(struct client_struct *client, char *data, int len)
 	int flen;
 
 	flen = client->rptr - client->wptr;
-	if (flen < 0) flen += FIFOSIZE;
+	if (flen <= 0) flen += FIFOSIZE;
 	if (flen <= len) return;	// no room left
 
 	flen = (len <= FIFOSIZE - client->wptr) ? len : FIFOSIZE - client->wptr;
@@ -1276,6 +1276,9 @@ static void ProcessCmd(char *cmd)
 		printf("Attached connections:\n");
 		for (i=0; i<Run.NCon; i++) printf("%2d\t%s\t%16Ld bytes %10d blocks %8d errors\n", 
 			i, My_inet_ntoa(Run.Con[i].ip), Run.Con[i].cnt, Run.Con[i].BlkCnt, Run.Con[i].ErrCnt);
+		printf("Data clients:\n");
+		for (i=0; i<MAXCON; i++) if (Run.Client[i].fd) printf("%d: %s  W(%6d) R(%6d)\n", 
+			i, My_inet_ntoa(Run.Client[i].ip), Run.Client[i].wptr, Run.Client[i].rptr);
 	} else if (!strcasecmp(tok, "pause")) {	// Pause
 		SetInhibit(1);
 	} else if (!strcasecmp(tok, "quit")) {	// Quit
