@@ -53,6 +53,7 @@ struct cfg_struct {
 	int AutoSize;			// in MBytes (2^20 bytes)
 	char ConfSavePattern[MAXSTR];	// pattern to copy configuration when dsink reads it
 	char LogSavePattern[MAXSTR];	// Pattern to rename the old log file before compression
+	int PeriodicTriggerPeriod;	// Period of the pulser trigger, ms. 0 - disabled, Maximum - 2^13-1.
 } Config;
 
 struct run_struct {
@@ -205,7 +206,7 @@ void ClientSend(struct client_struct *client)
 {
 	int flen, irc;
 	
-	flen = (client->wptr > client->rptr) ? client->wptr - client->rptr : FIFOSIZE > client->rptr;
+	flen = (client->wptr > client->rptr) ? client->wptr - client->rptr : FIFOSIZE - client->rptr;
 	irc = write(client->fd, &client->fifo[client->rptr], flen);
 	if (irc < 0) {
 		Log(TXT_WARN "DSINK: Client %s send error: %m\n", My_inet_ntoa(client->ip));
@@ -965,7 +966,10 @@ int ReadConf(const char *fname)
 	if (strlen(Config.LogSavePattern)) {
 		snprintf(cmd, MAXSTR, "f=%s;mv %s $f;bzip2 $f&", Config.LogSavePattern, Config.LogFile);
 		system(cmd);
-	}	
+	}
+//	int PeriodicTriggerPeriod;	// Period of the pulser trigger, ms
+	Config.PeriodicTriggerPeriod = (config_lookup_int(&cnf, "Sink.PeriodicTriggerPeriod", &tmp)) ? tmp : 0;
+	
 	config_destroy(&cnf);
 	return 0;
 }
@@ -1084,7 +1088,7 @@ void StartRun(void)
 		return;
 	}
 	sleep(1);
-	snprintf(str, MAXSTR, "z %d", Config.TriggerMasterModule);
+	snprintf(str, MAXSTR, "z %d;k %d %d", Config.TriggerMasterModule, Config.TriggerMasterModule, Config.PeriodicTriggerPeriod);
 	SendScript(&Run.Slave[Config.TriggerMasterCrate], str);
 	SetInhibit(0);
 	Log(TXT_INFO "DSINK: Executing START command.\n");
