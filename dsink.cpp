@@ -208,7 +208,7 @@ void ClientSend(struct client_struct *client)
 	
 	flen = (client->wptr > client->rptr) ? client->wptr - client->rptr : FIFOSIZE - client->rptr;
 	irc = write(client->fd, &client->fifo[client->rptr], flen);
-	if (irc < 0) {
+	if (irc < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
 		Log(TXT_WARN "DSINK: Client %s send error: %m\n", My_inet_ntoa(client->ip));
 		shutdown(client->fd, 2);
 		free(client->fifo);
@@ -614,7 +614,7 @@ int OpenClient(void)
 {
 	struct sockaddr_in addr;
 	socklen_t len;
-	int i, irc;
+	int i, irc, descr;
 
 	// Search for empty slot
 	for (i=0; i<MAXCON; i++) if (!Run.Client[i].fd) break;
@@ -626,10 +626,29 @@ int OpenClient(void)
 		Log(TXT_ERROR "DSINK: Client connection accept error: %m\n");
 		return -10;
 	}
+
 	Run.Client[i].fd = irc;
 	Run.Client[i].ip = addr.sin_addr.s_addr;
 	Run.Client[i].rptr = 0;
 	Run.Client[i].wptr = 0;
+
+	// Set client non-blocking
+	irc = fcntl(Run.Client[i].fd, F_GETFL, 0);
+	if (irc == -1) {
+		close(Run.Client[i].fd);
+		Run.Client[i].fd = 0;
+		Log(TXT_ERROR "DSINK: Client fcntl(F_GETFL) error: %m\n");
+		return -15;
+	}
+
+	descr = irc | O_NONBLOCK;
+	irc = fcntl(Run.Client[i].fd, F_SETFL, descr);
+	if (irc == -1) {
+		close(Run.Client[i].fd);
+		Run.Client[i].fd = 0;
+		Log(TXT_ERROR "DSINK: Client fcntl(F_SETFL) error: %m\n");
+		return -16;
+	}
 
 	Run.Client[i].fifo = (char *) malloc(FIFOSIZE);
 	if (!Run.Client[i].fifo) {
