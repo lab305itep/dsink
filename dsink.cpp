@@ -198,7 +198,7 @@ void ClientPush(struct client_struct *client, char *data, int len)
 	memcpy(&client->fifo[client->wptr], data, flen);
 	if (flen < len) memcpy(client->fifo, &data[flen], len - flen);
 	client->wptr += len;
-	if (client->wptr > FIFOSIZE) client->wptr -= FIFOSIZE;
+	if (client->wptr >= FIFOSIZE) client->wptr -= FIFOSIZE;
 }
 
 /*	Send data from fifo to TCP client			*/
