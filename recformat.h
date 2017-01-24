@@ -20,6 +20,10 @@ struct rec_header_struct {
 #define REC_CHANMASK	0x00FF0000	// channel mask
 #define REC_EVENT	0x80000000	// Event
 #define REC_EVTCNTMASK	0x7FFFFFFF	// Event counter - the 10 LSB - token
+#define REC_POSITION	0x02000000	// Position read from lift data file
+#define REC_SLOW	0x04000000	// Slow data
+#define REC_SLOWMASK	0x00FFFFFF	// Mask of slow sources
+#define LIFT_SRC	20001		// Platfom lift
 
 //	Data block type
 #define TYPE_SELF	0		// Self trigger waveform 

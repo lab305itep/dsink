@@ -22,7 +22,7 @@ private:
 	int DelimToken;		// Delimiter last token
 	short int SelfToken[64];	// self trig token
 	int ErrCnt[6];		// Error counters parity/presence WFDCHAN, TRIGSUM, TRIGTOKEN, DELIMTOKEN, SelfToken and length&other format errors
-	int BlkCnt;		// data block counter
+	long BlkCnt;		// data block counter
 	int SyncCnt;		// Count synchronization
 	struct blkinfo_struct BlkInfo;
 public:
@@ -31,7 +31,7 @@ public:
 	void Add(char *data, int len);		// add data to the buffer
 	struct blkinfo_struct *Get(void);	// return pointer to data block in the buffer. Analyze format errors. NULL on the data end
 	inline int *GetErrCnt(void) { return ErrCnt;};
-	inline int GetBlkCnt(void) { return BlkCnt;};
+	inline long GetBlkCnt(void) { return BlkCnt;};
 	void ClearCounters(void);
 	void ClearParity(void);
 	int GetLongDelim(void);

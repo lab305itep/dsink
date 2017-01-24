@@ -30,6 +30,7 @@
 struct cfg_struct {
 	int InPort;			// Data port 0xA336
 	int OutPort;			// Out port  0xB230
+	int udpPort;			// slow control port - 15629
 	char MyName[MAXSTR];		// The server host name
 	char SlaveList[MAXCON][MAXSTR];	// Crate host names list
 	int NSlaves;			// number of crates
@@ -54,6 +55,9 @@ struct cfg_struct {
 	char ConfSavePattern[MAXSTR];	// pattern to copy configuration when dsink reads it
 	char LogSavePattern[MAXSTR];	// Pattern to rename the old log file before compression
 	int PeriodicTriggerPeriod;	// Period of the pulser trigger, ms. 0 - disabled, Maximum - 2^13-1.
+	char PlatformPositionFile[MAXSTR];	// File with platform position (internal units = 1/6 of mm)
+	int MaxInitAttempts;		// Maximum number of attempts for automatic init
+	int LiftTimeout;		// Timeout after lift was moved (s)
 } Config;
 
 struct run_struct {
@@ -78,11 +82,14 @@ struct run_struct {
 	struct event_struct *Evt;	// Pointer to event cache
 	struct event_struct *EvtCopy;	// Pointer to event cache copy (for rotation)
 	int lTokenBase;			// long token of the first even in the cache
-	int TypeStat[8];		// record types statistics
-	int RecStat[2];			// events/selftriggers in the output file
-	int LastFileStarted;		// time() when the last file was started
-	long long FileCounter;		// bytes to the last file
+	long TypeStat[8];		// record types statistics
+	long RecStat[2];			// events/selftriggers in the output file
+	time_t LastFileStarted;		// time() when the last file was started
+	long FileCounter;		// bytes to the last file
 	int RestartFlag;		// flag restart
+	int SuspendFlag;		// flag to suspend run while platform is moving
+	time_t ReleaseTime;		// time to continue after suspend
+	int udpPort;			// slow control port
 } Run;
 
 /*				Functions			*/
@@ -161,6 +168,28 @@ int BindPort(int port)
 		return -1;
 	}
 	
+	return fd;
+}
+
+/*	Initialize data connection port				*/
+int BindUdpPort(int port)
+{
+	int fd, i, irc;
+	struct sockaddr_in name;
+
+	fd = socket(PF_INET, SOCK_DGRAM, 0);
+	if (fd < 0) {
+		Log(TXT_FATAL "DSINK: Can not create socket.: %m\n");
+		return fd;
+	}
+	name.sin_family = AF_INET;
+	name.sin_port = htons(port);
+	name.sin_addr.s_addr = htonl(INADDR_ANY);
+	if (bind(fd, (struct sockaddr *)&name, sizeof(name)) < 0) {
+		Log(TXT_FATAL "DSINK: Can not bind to port %d: %m\n", port);
+		close(fd);
+		return -1;
+	}
 	return fd;
 }
 
@@ -265,6 +294,7 @@ void DoSelect(int AcceptCommands)
 	if (AcceptCommands) FD_SET(fileno(rl_instream), &set);
 	FD_SET(Run.fdPort, &set);
 	FD_SET(Run.fdOut, &set);
+	FD_SET(Run.udpPort, &set);
 	for (i=0; i<Run.NCon; i++) FD_SET(Run.Con[i].fd, &set);
 	for (i=0; i<Config.NSlaves; i++) if (Run.Slave[i].PID) FD_SET(Run.Slave[i].out.fd[0], &set);
 	for (i=0; i<Config.NSlaves; i++) if (Run.Slave[i].PID) FD_SET(Run.Slave[i].err.fd[0], &set);
@@ -291,6 +321,7 @@ void DoSelect(int AcceptCommands)
 			}
 		}
 		if (FD_ISSET(Run.fdOut, &set) && OpenClient() > 0) DropCon(Run.fdOut);
+		if (FD_ISSET(Run.udpPort, &set)) ProcessSlow();
 		for (i=0; i<Run.NCon; i++) if (FD_ISSET(Run.Con[i].fd, &set)) GetAndWrite(i);
 		for (i=0; i<Config.NSlaves; i++) if (Run.Slave[i].PID && FD_ISSET(Run.Slave[i].out.fd[0], &set)) 
 			GetFromSlave(Config.SlaveList[i], &Run.Slave[i].out, &Run.Slave[i]);
@@ -524,12 +555,14 @@ void Info(void)
 	const char type_names[8][8] = {"SELF", "MAST", "TRIG", "RAW ", "HIST", "SYNC", "RSRV", "RSRV"};
 
 	printf("System Initialization %s done.\n", (Run.Initialized) ? "" : TXT_BOLDRED "not" TXT_NORMAL);
-	if (Run.fData) printf("File: %s: %Ld bytes / %d records: %d events + %d SelfTriggers / %d s\n", 
-		Run.fDataName, ftello(Run.fData), Run.fHead.cnt, Run.RecStat[0], Run.RecStat[1], time(NULL) - Run.LastFileStarted);
+	if (Run.fData) printf("File: %s: %Ld bytes / %d records: %Ld events + %Ld SelfTriggers / %d s\n", 
+		Run.fDataName, ftello(Run.fData), Run.fHead.cnt, Run.RecStat[0], Run.RecStat[1], (int)(time(NULL) - Run.LastFileStarted));
+	if (Run.SuspendFlag == 1) printf("Run suspended for platform moution.\n");
+	if (Run.SuspendFlag == 2) printf("Run suspended for platform moution till %s", ctime(&Run.ReleaseTime));
 	printf("Modules: ");
 	for (i=0; i<MAXWFD; i++) if (Run.WFD[i]) printf("%d ", i+1);
 	printf("\nRecord types: ");
-	for (i=0; i<8; i++) printf("%s: %d  ", type_names[i], Run.TypeStat[i]);
+	for (i=0; i<8; i++) printf("%s: %Ld  ", type_names[i], Run.TypeStat[i]);
 	printf("\n");
 	BlkCnt = 0;
 	flag = 0;
@@ -546,7 +579,7 @@ void Info(void)
 			}
 			printf(" %3d:  ", i+1);
 			for (j=0; j<=ERR_OTHER; j++) printf((cnt[j]) ? TXT_BOLDRED "%10d " TXT_NORMAL : "%10d ", cnt[j]);
-			printf("%10d\n", Run.WFD[i]->GetBlkCnt());
+			printf("%12Ld\n", Run.WFD[i]->GetBlkCnt());
 		}
 	}
 	printf("Grand total %Ld blocks received.\n", BlkCnt);
@@ -555,24 +588,25 @@ void Info(void)
 void Init(void)
 {
 	char cmd[MAXSTR];
-	int i;
+	int i, j;
+	int Flag[MAXCON];
 
 	Run.Initialized = 0;
+	memset(Flag, 0, sizeof(Flag));
 	snprintf(cmd, MAXSTR, "p * %s;?", Config.XilinxFirmware);
-	for (i=0; i<Config.NSlaves; i++) if (Run.Slave[i].PID) SendScript(&Run.Slave[i], cmd);
-	for (i=0; i<Config.NSlaves; i++) while (Run.Slave[i].IsWaiting) DoSelect(0);
-	for (i=0; i<Config.NSlaves; i++) if (Run.Slave[i].LastResponse) break;
-	if (i != Config.NSlaves) {
-		Log(TXT_ERROR "DSINK: Can not load firmware - check VME responses.\n");
-		printf(TXT_BOLDRED "Init failed. Check the system and try again." TXT_NORMAL "\n");
-		return;
+	for (j = 0; j < Config.MaxInitAttempts; j++) {
+		for (i=0; i<Config.NSlaves; i++) if (Run.Slave[i].PID && !Flag[i]) SendScript(&Run.Slave[i], cmd);
+		for (i=0; i<Config.NSlaves; i++) while (!Flag[i] && Run.Slave[i].IsWaiting) DoSelect(0);
+		for (i=0; i<Config.NSlaves; i++) if (!Flag[i] && !Run.Slave[i].LastResponse) Flag[i] = 1;
+		sleep(1);
+		for (i=0; i<Config.NSlaves; i++) if (Flag[i] == 1) SendScript(&Run.Slave[i], "i *;?");
+		for (i=0; i<Config.NSlaves; i++) while (Flag[i] == 1 && Run.Slave[i].IsWaiting) DoSelect(0);
+		for (i=0; i<Config.NSlaves; i++) if (Flag[i] == 1) Flag[i] = (Run.Slave[i].LastResponse) ? 0 : 2;
+		for (i=0; i<Config.NSlaves; i++) if (Flag[i] != 2) break;
+		if (i == Config.NSlaves) break;
 	}
-	sleep(1);
-	for (i=0; i<Config.NSlaves; i++) if (Run.Slave[i].PID) SendScript(&Run.Slave[i], "i *;?");
-	for (i=0; i<Config.NSlaves; i++) while (Run.Slave[i].IsWaiting) DoSelect(0);
-	for (i=0; i<Config.NSlaves; i++) if (Run.Slave[i].LastResponse) break;
 	if (i != Config.NSlaves) {
-		Log(TXT_ERROR "DSINK: Can not initialize the modules - check VME responses.\n");
+		Log(TXT_ERROR "DSINK: Can not initialize the modules in %d attempts - check VME responses.\n", Config.MaxInitAttempts);
 		printf(TXT_BOLDRED "Init failed. Check the system and try again." TXT_NORMAL "\n");
 		return;
 	}
@@ -725,6 +759,7 @@ void OpenDataFile(const char *name)
 	memset(Run.RecStat, 0, sizeof(Run.RecStat));
 	Run.LastFileStarted = time(NULL);
 	Run.FileCounter = 0;
+	WritePlatformPosition();
 }
 
 /*	Open log file and xterm							*/
@@ -847,6 +882,54 @@ void ProcessData(char *buf)
 	};
 }
 
+void ProcessSlow(void)
+{
+	struct {
+		int len;
+		int src;
+		int data[0x3FFE];	// udp record is 64k maximum
+	} buf;
+	int irc;
+	void *ptr;
+//		receive the record
+	irc = read(Run.udpPort, &buf, sizeof(buf));
+	if (irc < 2 * sizeof(int) || irc != buf.len) return;	// strange record - nothing to do (error?)
+//		save to data file
+	irc += sizeof(struct rec_header_struct) - 2 * sizeof(int);
+	if (Run.wDataSize < irc) {
+		ptr = realloc(Run.wData, irc);
+		if (!ptr) {
+			Log(TXT_ERROR "DSINK: Memory allocation failure of %d bytes in ProcessSlow %m.\n", irc);
+			goto skip_slow_write;
+		}
+		Run.wData = ptr;
+		Run.wDataSize = irc;
+	}
+
+	Run.fHead.len = irc;
+	Run.fHead.type = REC_SLOW | (buf.src & REC_SLOWMASK);
+	Run.fHead.time = time(NULL);
+	memcpy(Run.wData, &Run.fHead, sizeof(struct rec_header_struct));
+	if (irc > sizeof(struct rec_header_struct)) 
+		memcpy((char *)Run.wData + sizeof(struct rec_header_struct), buf.data, irc - sizeof(struct rec_header_struct));
+	WriteAndSend();
+skip_slow_write:
+//		Analize the record
+	switch(buf.src) {
+	case LIFT_SRC:
+		if ((!(Run.SuspendFlag & SUSPEND_FLAG) && !buf.data[0]) || !Run.iAuto) break;
+		if (buf.data[0]) {
+			Run.SuspendFlag = SUSPEND_FLAG;
+		} else {
+			Run.SuspendFlag = RELEASE_FLAG;
+			Run.ReleaseTime = time(NULL) + Config.LiftTimeout;
+		}
+		break;
+	default:				// skip unknown records
+		break;
+	}
+}
+
 /*	Read configuration file							*/
 int ReadConf(const char *fname)
 {
@@ -869,6 +952,8 @@ int ReadConf(const char *fname)
 	Config.InPort = (config_lookup_int(&cnf, "Sink.InPort", &tmp)) ? tmp : 0xA336;
 //	int OutPort;			// Out port 0xB230
 	Config.OutPort = (config_lookup_int(&cnf, "Sink.OutPort", &tmp)) ? tmp : 0xB230;
+//	int udpPort;			// udp port 15629
+	Config.udpPort = (config_lookup_int(&cnf, "Sink.udpPort", &tmp)) ? tmp : 15629;
 //	char MyName[MAXSTR];		// The server host name
 	strncpy(Config.MyName, (config_lookup_string(&cnf, "Sink.MyName", (const char **) &stmp)) ? stmp : "dserver.danss.local", MAXSTR);
 //	char SlaveList[MAXCON][MAXSTR];	// Crate host names list
@@ -971,7 +1056,7 @@ int ReadConf(const char *fname)
 //	char AutoName[MAXSTR];		// auto file name format
 	strncpy(Config.AutoName, (config_lookup_string(&cnf, "Sink.AutoName", (const char **) &stmp)) ? stmp : "danss_data_%6.6d.data", MAXSTR);
 //	int AutoTime;			// half an hour
-	Config.AutoTime = (config_lookup_int(&cnf, "Sink.AutoTime", &tmp)) ? tmp : 600;
+	Config.AutoTime = (config_lookup_int(&cnf, "Sink.AutoTime", &tmp)) ? tmp : 1800;
 //	int AutoSize;			// in MBytes (2^20 bytes)
 	Config.AutoSize = (config_lookup_int(&cnf, "Sink.AutoSize", &tmp)) ? tmp : 10;
 //	char ConfSavePattern[MAXSTR];	// pattern to copy configuration when dsink reads it
@@ -988,7 +1073,14 @@ int ReadConf(const char *fname)
 	}
 //	int PeriodicTriggerPeriod;	// Period of the pulser trigger, ms
 	Config.PeriodicTriggerPeriod = (config_lookup_int(&cnf, "Sink.PeriodicTriggerPeriod", &tmp)) ? tmp : 0;
-	
+//	char PlatformPositionFile[MAXSTR];	// File name of the platform position
+	strncpy(Config.PlatformPositionFile, (config_lookup_string(&cnf, "Sink.PlatformPositionFile", 
+		(const char **) &stmp)) ? stmp : "/var/lib/tftpboot/lift/var/log/liftposition.txt", MAXSTR);
+//	int MaxInitAttempts;			// Maximum number attempts for automatic init
+	Config.MaxInitAttempts = (config_lookup_int(&cnf, "Sink.MaxInitAttempts", &tmp)) ? tmp : 5;
+//	int LiftTimeout;		// Timeout after lift was moved (s)
+	Config.LiftTimeout = (config_lookup_int(&cnf, "Sink.LiftTimeout", &tmp)) ? tmp : 300;
+
 	config_destroy(&cnf);
 	return 0;
 }
@@ -1118,6 +1210,7 @@ void StartRun(void)
 	Run.lTokenBase = 0;
 	Run.iRun = 1;
 	memset(Run.TypeStat, 0, sizeof(Run.TypeStat));
+	Run.SuspendFlag = 0;
 }
 
 /*	Stop DAQ								*/
@@ -1168,6 +1261,7 @@ void SwitchAutoFile(void)
 	memset(Run.RecStat, 0, sizeof(Run.RecStat));
 	Run.LastFileStarted = time(NULL);
 	Run.FileCounter = 0;
+	WritePlatformPosition();
 //	SetInhibit(0);
 }
 
@@ -1215,6 +1309,40 @@ void WriteEvent(int lToken, struct event_struct *event)
 	memcpy((char *)Run.wData + sizeof(struct rec_header_struct), event->data, event->len);
 
 	Run.RecStat[0]++;
+	WriteAndSend();
+}
+
+void WritePlatformPosition(void)
+{
+	FILE *f;
+	int pos[4];
+	int len;
+	void *ptr;
+	
+	f = fopen(Config.PlatformPositionFile, "rt");
+	if (!f) {
+		Log(TXT_WARN "DSINK: Can not read the file with platform position %s: %m.\n", Config.PlatformPositionFile);
+		return;
+	}
+	fscanf(f, "%d %d %d %d", &pos[0], &pos[1], &pos[2], &pos[3]);
+	fclose(f);
+	len = sizeof(struct rec_header_struct) + sizeof(pos);
+	if (Run.wDataSize < len) {
+		ptr = realloc(Run.wData, len);
+		if (!ptr) {
+			Log(TXT_ERROR "DSINK: Memory allocation failure of %d bytes in WritePlatformPosition %m.\n", len);
+			return;
+		}
+		Run.wData = ptr;
+		Run.wDataSize = len;
+	}
+
+	Run.fHead.len = len;
+	Run.fHead.type = REC_POSITION;
+	Run.fHead.time = time(NULL);
+	memcpy(Run.wData, &Run.fHead, sizeof(struct rec_header_struct));
+	memcpy((char *)Run.wData + sizeof(struct rec_header_struct), pos, sizeof(pos));
+
 	WriteAndSend();
 }
 
@@ -1361,9 +1489,12 @@ int main(int argc, char **argv)
 	if (Run.fdPort < 0) goto MyExit;	
 
 	Run.fdOut = BindPort(Config.OutPort);
-	if (Run.fdOut < 0) goto MyExit;	
+	if (Run.fdOut < 0) goto MyExit;
 
 	if (OpenSlaves()) goto MyExit;
+
+	Run.udpPort = BindUdpPort(Config.udpPort);
+	if (Run.udpPort < 0) goto MyExit;
 
 	rl_callback_handler_install("DSINK > ", ProcessCmd);	
 	if (iAutoStart) {
@@ -1374,8 +1505,14 @@ int main(int argc, char **argv)
 //		Event loop
 	while (!Run.iStop) {
 		DoSelect(1);
+		if (Run.iRun && Run.SuspendFlag) StopRun();
 		if (Run.RestartFlag) RestartRun();
 		if (Run.iAuto && Run.fData && time(NULL) > Run.LastFileStarted + Config.AutoTime) SwitchAutoFile();
+		if ((Run.SuspendFlag & RELEASE_FLAG) && time(NULL) > Run.ReleaseTime) {
+			Run.SuspendFlag = 0;
+			StartRun();
+			if (Run.iAuto) OpenDataFile("auto");
+		} 
 	}
 MyExit:
 	Log(TXT_INFO "DSINK: Exit.\n");
@@ -1385,8 +1522,10 @@ MyExit:
 		close(Run.Con[i].fd);
 	}
 
+	if (Run.udpPort > 0) close(Run.udpPort);
+
 	CloseSlaves();
-	if (Run.fdPort)	close(Run.fdPort);
+	if (Run.fdPort > 0) close(Run.fdPort);
 	FlushEvents(-1);
 	if (Run.Evt) {
 		for (i=0; i<Config.MaxEvent; i++) if (Run.Evt[i].data) free(Run.Evt[i].data);
@@ -1395,7 +1534,7 @@ MyExit:
 	if (Run.EvtCopy) free(Run.EvtCopy);
 	CloseDataFile();
 	if (Run.wData) free(Run.wData);
-	if (Run.fdOut)	close(Run.fdOut);
+	if (Run.fdOut > 0) close(Run.fdOut);
 	for (i=0; i<MAXCON; i++) if (Run.Client[i].fd) {
 		shutdown(Run.Client[i].fd, 2);
 		free(Run.Client[i].fifo);

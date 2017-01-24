@@ -25,6 +25,8 @@
 #define TXT_FATAL	TXT_BOLDRED    " FATAL " TXT_NORMAL
 #define DATA_DIR	"data/"
 #define DATA_LOG	"datalog.txt"
+#define SUSPEND_FLAG	1
+#define RELEASE_FLAG	2
 
 /*				Types and declarations		*/
 struct con_struct {
@@ -33,7 +35,7 @@ struct con_struct {
 	char *buf;
 	int len;
 	long cnt;
-	int BlkCnt;
+	long BlkCnt;
 	int ErrCnt;
 	struct rec_header_struct *header;
 };
@@ -80,12 +82,15 @@ char *My_inet_ntoa(int num);
 int OpenClient(void);
 void OpenCon(int fd, con_struct *con);
 void ProcessData(char *buf);
+void ProcessSlow(void);
 void SendFromFifo(struct slave_struct *slave);
 void SendScript(struct slave_struct *slave, const char *script);
 pid_t StartProcess(char *cmd);
 void StartRun(void);
 void StopRun(void);
+void WriteAndSend(void);
 void WriteEvent(int lToken, struct event_struct *event);
+void WritePlatformPosition(void);
 void WriteSelfTrig(int num, struct blkinfo_struct *info);
 
 #endif
