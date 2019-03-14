@@ -32,6 +32,8 @@ struct rec_header_struct {
 #define TYPE_RAW	3		// Raw waveform
 #define TYPE_SUM	4		// digital sum of channels waveform 
 #define TYPE_DELIM	5		// synchronisation delimiter
+#define TYPE_PROP	6		// special type for prop chamber info
+#define TYPE_CYCLE	7		// long trigger == cycle end signature
 
 #endif /* RECFORMAT_H */
 

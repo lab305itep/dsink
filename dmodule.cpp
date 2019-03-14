@@ -149,7 +149,7 @@ Again:
 	}
 	if (tokerr) goto Again;
 //		Check for forbidden tokens
-	if (type == TYPE_MASTER || type == TYPE_RAW || type == TYPE_TRIG || type == TYPE_SUM) {
+	if (type == TYPE_MASTER || type == TYPE_RAW || type == TYPE_TRIG || type == TYPE_SUM || type == TYPE_CYCLE) {
 		i = 0;
 		switch(DelimToken) {
 		case -1:
