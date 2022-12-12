@@ -12,6 +12,7 @@ struct blkinfo_struct {
 class Dmodule {
 private:
 	int Serial;		// Module serial number
+	int Status;		// Module presence status - 0: not found 1: found
 	unsigned short int *buf;	// Data buffer
 	int rptr;		// read pointer, bytes
 	int wptr;		// write pointer, bytes
@@ -36,6 +37,8 @@ public:
 	void ClearParity(void);
 	int GetLongDelim(void);
 	void Reset(void);
+	inline void SetStatus(int val) { Status = val;};
+	inline int GetStatus(void) { return Status;};
 };
 
 //	Indexes in ErrCnt

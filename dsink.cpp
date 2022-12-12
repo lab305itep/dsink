@@ -351,6 +351,27 @@ void DropCon(int fd)
 	close(irc);
 }
 
+/*	Look for line like:
+    "Modules:  35  36  16  17  18  19  21  22  23  24  20"
+	and set WFD presence
+*/
+void FindModulesLine(char *str)
+{
+	char *ptr;
+	int i;
+	
+	ptr = strstr(str, "Modules:");
+	if (!ptr) return;
+	ptr += strlen("Modules:");
+	for(;;) {
+		if (!ptr) return;
+		i = strtol(ptr, &ptr, 10) - 1;
+		if (i < 0) return;
+		if (i >= MAXWFD) continue;
+		if (Run.WFD[i]) Run.WFD[i]->SetStatus(1);
+	}
+}
+
 /*	Save to disk all events with long token less than lToken	
 	lToken = -1 - all events					*/
 void FlushEvents(int lToken)
@@ -473,6 +494,7 @@ void GetFromSlave(char *name, struct pipe_struct *p, struct slave_struct *slave)
 			SendFromFifo(slave);
 		}
 	} else {
+		FindModulesLine(p->buf);
 		Log(TXT_INFO "%s: %s", name, p->buf);
 	}
 	p->wptr = 0;
@@ -593,11 +615,23 @@ void Init(void)
 
 	Run.Initialized = 0;
 	memset(Flag, 0, sizeof(Flag));
+	for (i=0; i<MAXWFD; i++) if (Run.WFD[i]) Run.WFD[i]->SetStatus(0);	// clear presence status
 	snprintf(cmd, MAXSTR, "p * %s;?", Config.XilinxFirmware);
 	for (j = 0; j < Config.MaxInitAttempts; j++) {
 		for (i=0; i<Config.NSlaves; i++) if (Run.Slave[i].PID && !Flag[i]) SendScript(&Run.Slave[i], cmd);
 		for (i=0; i<Config.NSlaves; i++) while (!Flag[i] && Run.Slave[i].IsWaiting) DoSelect(0);
 		for (i=0; i<Config.NSlaves; i++) if (!Flag[i] && !Run.Slave[i].LastResponse) Flag[i] = 1;
+		j = 0;
+		for (i=0; i<MAXWFD; i++) if (Run.WFD[i] && !Run.WFD[i]->GetStatus()) {
+			Log(TXT_ERROR "DSINK: Module %d not present.\n", i+1);
+			printf(TXT_BOLDRED "Attention !!! Module %d not present." TXT_NORMAL "\n", i+1);
+			j++;
+		}
+		if (j) {
+			Log(TXT_ERROR "DSINK: Initialization failed.\n");
+			printf(TXT_BOLDRED "Initialization failed." TXT_NORMAL "\n");
+			return;
+		}
 		sleep(1);
 		for (i=0; i<Config.NSlaves; i++) if (Flag[i] == 1) SendScript(&Run.Slave[i], "i *;?");
 		for (i=0; i<Config.NSlaves; i++) while (Flag[i] == 1 && Run.Slave[i].IsWaiting) DoSelect(0);
@@ -611,7 +645,7 @@ void Init(void)
 		return;
 	}
 //		Clear inhibit on VETO module
-	snprintf(cmd, MAXSTR, "m %d 0;?", Config.VetoMasterModule);	
+	snprintf(cmd, MAXSTR, "m %d 0;?", Config.VetoMasterModule);
 	SendScript(&Run.Slave[Config.VetoMasterCrate], cmd);
 
 	Run.Initialized = 1;

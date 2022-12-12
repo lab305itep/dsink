@@ -74,6 +74,7 @@ struct event_struct {
 void Add2Event(int num, struct blkinfo_struct *info);
 void CheckReadyEvents(void);
 void DropCon(int fd);
+void FindModulesLine(char *str);
 void FlushEvents(int lToken);
 void GetAndWrite(int num);
 void GetFromSlave(char *name, struct pipe_struct *p, struct slave_struct *slave);

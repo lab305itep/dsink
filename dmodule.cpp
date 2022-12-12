@@ -12,6 +12,7 @@
 Dmodule::Dmodule(int num)
 {
 	Serial = num;
+	Status = 0;
 	buf = (unsigned short int *) malloc(BSIZE);
 	if (!buf) {
 		Log(TXT_FATAL "DSINK: Memory allocation failure for module %d\n", Serial);
